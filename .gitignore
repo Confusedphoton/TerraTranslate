@@ -1,0 +1,9 @@
+/target/
+/.idea/
+/.vscode/
+*.db
+*.db-shm
+*.db-wal
+*.sock
+.env
+Cargo.lock

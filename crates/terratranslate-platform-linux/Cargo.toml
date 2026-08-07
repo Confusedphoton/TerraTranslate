@@ -1,0 +1,18 @@
+[package]
+name = "terratranslate-platform-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ashpd.workspace = true
+pipewire.workspace = true
+png.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+terratranslate-wine-protocol = { path = "../terratranslate-wine-protocol" }
+
+[dev-dependencies]
+uuid.workspace = true

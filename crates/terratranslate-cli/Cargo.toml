@@ -1,0 +1,23 @@
+[package]
+name = "terratranslate-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+terratranslate-core = { path = "../terratranslate-core" }
+terratranslate-engine = { path = "../terratranslate-engine" }
+terratranslate-provider = { path = "../terratranslate-provider" }
+terratranslate-platform-linux = { path = "../terratranslate-platform-linux" }
+terratranslate-store = { path = "../terratranslate-store" }
+
+[[bin]]
+name = "terratranslate-cli"
+path = "src/main.rs"

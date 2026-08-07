@@ -1,0 +1,13 @@
+[package]
+name = "terratranslate-wine-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmp-serde.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+

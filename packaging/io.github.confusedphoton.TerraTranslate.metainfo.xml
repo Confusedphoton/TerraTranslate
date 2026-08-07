@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.confusedphoton.TerraTranslate</id>
+  <name>TerraTranslate</name>
+  <developer id="io.github.confusedphoton">
+    <name>Confusedphoton</name>
+  </developer>
+  <summary>Native multimodal translation harness for Linux and Wine</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <description>
+    <p>Translate selected applications using direct window frames, hooked text, application audio, and stateful language-model context.</p>
+  </description>
+  <launchable type="desktop-id">io.github.confusedphoton.TerraTranslate.desktop</launchable>
+  <url type="homepage">https://github.com/Confusedphoton/TerraTranslate</url>
+  <content_rating type="oars-1.1" />
+</component>

@@ -1,0 +1,24 @@
+app-id: io.github.confusedphoton.TerraTranslate
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: terratranslate
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --filesystem=xdg-run/pipewire-0
+modules:
+  - name: terratranslate
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release -p terratranslate-app --bin terratranslate
+      - install -Dm755 target/release/terratranslate /app/bin/terratranslate
+      - install -Dm644 packaging/io.github.confusedphoton.TerraTranslate.desktop /app/share/applications/io.github.confusedphoton.TerraTranslate.desktop
+      - install -Dm644 packaging/io.github.confusedphoton.TerraTranslate.metainfo.xml /app/share/metainfo/io.github.confusedphoton.TerraTranslate.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
+      # Release builds must add vendored Cargo sources generated from Cargo.lock here.

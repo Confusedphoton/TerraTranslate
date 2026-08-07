@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TerraTranslate
+Comment=Multimodal translation harness for Linux and Wine
+Exec=terratranslate
+Icon=io.github.confusedphoton.TerraTranslate
+Terminal=false
+Categories=Utility;Languages;
+Keywords=translation;visual novel;wine;llm;
+
