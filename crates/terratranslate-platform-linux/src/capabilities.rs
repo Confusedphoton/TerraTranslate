@@ -14,6 +14,7 @@ pub struct DesktopCapabilities {
     pub portal_capture_possible: bool,
     pub portal_shortcuts_possible: bool,
     pub consuming_shortcuts_possible: bool,
+    pub hud_possible: bool,
     pub spatial_overlay_possible: bool,
     pub diagnostics: Vec<String>,
 }
@@ -35,7 +36,7 @@ impl DesktopCapabilities {
         let mut diagnostics = Vec::new();
         match display_server {
             DisplayServer::Wayland => diagnostics.push(
-                "Wayland capture and shortcuts require compositor portal approval; arbitrary overlay positioning is not guaranteed."
+                "Wayland capture and shortcuts require compositor portal approval; a movable/resizable HUD is available, but arbitrary target-relative overlay positioning is not guaranteed."
                     .into(),
             ),
             DisplayServer::X11 => diagnostics.push(
@@ -51,6 +52,7 @@ impl DesktopCapabilities {
             portal_shortcuts_possible: portal && display_server == DisplayServer::Wayland,
             consuming_shortcuts_possible: display_server == DisplayServer::X11
                 || (portal && display_server == DisplayServer::Wayland),
+            hud_possible: display_server != DisplayServer::Unknown,
             spatial_overlay_possible: display_server == DisplayServer::X11,
             diagnostics,
         }

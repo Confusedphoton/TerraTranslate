@@ -10,6 +10,7 @@ anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
 dirs.workspace = true
+libloading.workspace = true
 relm4.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -17,6 +17,10 @@ use terratranslate_platform_linux::{
 };
 use terratranslate_store::SessionStore;
 
+mod hud;
+
+use hud::HudWindow;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -47,12 +51,14 @@ struct AppModel {
     capture_session: Option<WindowCaptureSession>,
     frame_receiver: Option<PortalFrameReceiver>,
     shortcut_session: Option<PortalShortcutSession>,
+    hud: HudWindow,
 }
 
 #[derive(Debug)]
 enum AppMsg {
     SelectWindow,
     RegisterShortcut,
+    ShowHud,
     BranchInput(String),
     CreateBranch,
     ScratchpadInput(String),
@@ -99,6 +105,10 @@ impl Component for AppModel {
                     gtk::Button {
                         set_label: "Claim shortcut",
                         connect_clicked => AppMsg::RegisterShortcut,
+                    },
+                    gtk::Button {
+                        set_label: "Show HUD",
+                        connect_clicked => AppMsg::ShowHud,
                     },
                 },
 
@@ -208,6 +218,7 @@ impl Component for AppModel {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let display = format!("{:?}", init.capabilities.display_server);
+        let hud = HudWindow::new(&root, &init.capabilities);
         let mut model = Self {
             store: init.store,
             status: format!("Desktop: {display}. Ready."),
@@ -219,6 +230,7 @@ impl Component for AppModel {
             capture_session: None,
             frame_receiver: None,
             shortcut_session: None,
+            hud,
         };
         model.refresh_branches();
         let widgets = view_output!();
@@ -271,6 +283,7 @@ impl Component for AppModel {
                     )
                 });
             }
+            AppMsg::ShowHud => self.hud.present(),
             AppMsg::BranchInput(value) => self.branch_input = value,
             AppMsg::CreateBranch => {
                 let result = self.store.branch(&self.active_branch).and_then(|branch| {
@@ -320,6 +333,9 @@ impl Component for AppModel {
                 self.status = format!(
                     "Capture permission active for {} PipeWire stream(s).",
                     streams.len()
+                );
+                self.hud.set_message(
+                    "Translations will stream here.\n\nCapture permission is active; hook text and application audio will join the next translated turn.",
                 );
                 self.capture_streams = streams;
                 self.capture_session = Some(session);
