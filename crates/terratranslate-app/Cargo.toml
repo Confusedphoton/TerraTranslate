@@ -12,13 +12,18 @@ clap.workspace = true
 dirs.workspace = true
 libloading.workspace = true
 relm4.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 terratranslate-core = { path = "../terratranslate-core" }
+terratranslate-engine = { path = "../terratranslate-engine" }
 terratranslate-platform-linux = { path = "../terratranslate-platform-linux" }
+terratranslate-provider = { path = "../terratranslate-provider" }
 terratranslate-store = { path = "../terratranslate-store" }
+terratranslate-wine-protocol = { path = "../terratranslate-wine-protocol" }
 
 [[bin]]
 name = "terratranslate"

@@ -1,0 +1,18 @@
+[package]
+name = "terratranslate-native-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blake3.workspace = true
+libc.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+terratranslate-wine-protocol = { path = "../terratranslate-wine-protocol" }
+uuid.workspace = true

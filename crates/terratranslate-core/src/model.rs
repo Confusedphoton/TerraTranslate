@@ -44,6 +44,7 @@ pub enum Modality {
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     WineHook,
+    NativeHook,
     WindowCapture,
     ApplicationAudio,
     Manual,
@@ -123,6 +124,10 @@ pub struct ProcessorTrace {
     pub input_digest: String,
     pub output_digest: String,
     pub elapsed_micros: u64,
+    /// Source-selection context for this invocation. This keeps per-hook processor
+    /// choices auditable without changing processor implementations.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

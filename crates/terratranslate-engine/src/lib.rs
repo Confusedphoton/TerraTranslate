@@ -14,11 +14,30 @@ use terratranslate_provider::{
 };
 use terratranslate_store::{SessionStore, StoreError};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextProcessingSelection {
+    /// Processor IDs to run, in this order, before this text is sent to the model.
+    pub pre_prompt: Vec<String>,
+    /// Processor IDs to run, in this order, on the translation produced for this text.
+    pub post_translation: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputOptions {
+    /// Stable producer identity, independent of a connection UUID, PID, or ASLR.
+    pub stable_hook_key: Option<String>,
+    /// An optional user-facing name that is included with this input in the model request.
+    pub label: Option<String>,
+    pub processing: TextProcessingSelection,
+}
+
 pub struct TurnInput {
     pub captured_at_ms: i64,
     pub source: SourceKind,
     pub target: String,
     pub input: ModelInput,
+    /// `None` retains the legacy behavior of running every registered processor.
+    pub text_options: Option<TextInputOptions>,
 }
 
 pub struct TurnRequest {
@@ -46,6 +65,8 @@ pub enum EngineError {
     BranchMoved,
     #[error("translation turn contains no inputs")]
     EmptyTurn,
+    #[error("text inputs in one model turn selected different post-processing pipelines")]
+    IncompatiblePostProcessing,
 }
 
 pub struct TranslationEngine {
@@ -85,6 +106,8 @@ impl TranslationEngine {
         let mut model_inputs = Vec::new();
         let mut source_text_parts = Vec::new();
         let mut trace = Vec::new();
+        let mut post_translation_selection: Option<Option<Vec<String>>> = None;
+        let processors = self.processors.clone();
 
         for input in turn.inputs {
             let (modality, media_type, bytes) = match &input.input {
@@ -106,6 +129,33 @@ impl TranslationEngine {
                 media_type,
                 byte_len: bytes.len() as u64,
             };
+            let mut metadata = std::collections::BTreeMap::new();
+            if let Some(options) = &input.text_options {
+                if let Some(stable_hook_key) = options
+                    .stable_hook_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                {
+                    metadata.insert("stable_hook_key".into(), stable_hook_key.to_owned());
+                }
+                if let Some(label) = options
+                    .label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                {
+                    metadata.insert("text_hook_label".into(), label.to_owned());
+                }
+                metadata.insert(
+                    "pre_prompt_processors".into(),
+                    options.processing.pre_prompt.join(","),
+                );
+                metadata.insert(
+                    "post_translation_processors".into(),
+                    options.processing.post_translation.join(","),
+                );
+            }
             source_events.push(SourceEvent {
                 id: EventId::new(),
                 captured_at_ms: input.captured_at_ms,
@@ -113,16 +163,45 @@ impl TranslationEngine {
                 source: input.source,
                 target: input.target,
                 payload,
-                metadata: Default::default(),
+                metadata,
             });
 
             match input.input {
                 ModelInput::Text(text) => {
-                    let processed = self
-                        .run_stage(ProcessorStage::PrePrompt, text, &context, &mut trace)
-                        .await?;
+                    let selected_pre_processors = input
+                        .text_options
+                        .as_ref()
+                        .map(|options| options.processing.pre_prompt.as_slice());
+                    let processed = Self::run_stage(
+                        &processors,
+                        ProcessorStage::PrePrompt,
+                        text,
+                        &context,
+                        &mut trace,
+                        selected_pre_processors,
+                        processor_metadata(input.text_options.as_ref()),
+                    )
+                    .await?;
                     source_text_parts.push(processed.clone());
-                    model_inputs.push(ModelInput::Text(processed));
+                    model_inputs.push(ModelInput::Text(label_text_input(
+                        input
+                            .text_options
+                            .as_ref()
+                            .and_then(|options| options.label.as_deref()),
+                        processed,
+                    )));
+
+                    let selected_post_processors = input
+                        .text_options
+                        .as_ref()
+                        .map(|options| options.processing.post_translation.clone());
+                    match &post_translation_selection {
+                        Some(existing) if existing != &selected_post_processors => {
+                            return Err(EngineError::IncompatiblePostProcessing);
+                        }
+                        None => post_translation_selection = Some(selected_post_processors),
+                        _ => {}
+                    }
                 }
                 other => model_inputs.push(other),
             }
@@ -137,14 +216,18 @@ impl TranslationEngine {
         };
         validate_request(self.provider.capabilities(), &model_request)?;
         let response = self.provider.translate(model_request).await?;
-        let translated_text = self
-            .run_stage(
-                ProcessorStage::PostTranslation,
-                response.translated_text,
-                &context,
-                &mut trace,
-            )
-            .await?;
+        let translated_text = Self::run_stage(
+            &processors,
+            ProcessorStage::PostTranslation,
+            response.translated_text,
+            &context,
+            &mut trace,
+            post_translation_selection
+                .as_ref()
+                .and_then(|selection| selection.as_deref()),
+            aggregate_processor_metadata(&source_events),
+        )
+        .await?;
 
         let previous_scratchpad = context.scratchpad.clone();
         apply_patch(&mut context, response.context_patch);
@@ -192,16 +275,26 @@ impl TranslationEngine {
     }
 
     async fn run_stage(
-        &self,
+        processors: &[Arc<dyn TextProcessor>],
         stage: ProcessorStage,
         mut text: String,
         context: &ContextSnapshot,
         trace: &mut Vec<ProcessorTrace>,
+        selected_processor_ids: Option<&[String]>,
+        metadata: std::collections::BTreeMap<String, String>,
     ) -> Result<String, EngineError> {
-        for processor in &self.processors {
-            if !processor.stages().contains(&stage) {
-                continue;
-            }
+        let selected = match selected_processor_ids {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| processors.iter().find(|processor| processor.id() == id))
+                .filter(|processor| processor.stages().contains(&stage))
+                .collect::<Vec<_>>(),
+            None => processors
+                .iter()
+                .filter(|processor| processor.stages().contains(&stage))
+                .collect::<Vec<_>>(),
+        };
+        for processor in selected {
             let input_digest = blake3::hash(text.as_bytes()).to_hex().to_string();
             let started = Instant::now();
             let response = processor
@@ -222,10 +315,69 @@ impl TranslationEngine {
                 input_digest,
                 output_digest: blake3::hash(text.as_bytes()).to_hex().to_string(),
                 elapsed_micros: started.elapsed().as_micros() as u64,
+                metadata: metadata.clone(),
             });
         }
         Ok(text)
     }
+}
+
+fn processor_metadata(
+    options: Option<&TextInputOptions>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut metadata = std::collections::BTreeMap::new();
+    let Some(options) = options else {
+        return metadata;
+    };
+    if let Some(key) = options.stable_hook_key.as_deref() {
+        metadata.insert("stable_hook_key".into(), key.to_owned());
+    }
+    if let Some(label) = options.label.as_deref() {
+        metadata.insert("text_hook_label".into(), label.to_owned());
+    }
+    metadata.insert(
+        "pre_prompt_processors".into(),
+        options.processing.pre_prompt.join(","),
+    );
+    metadata.insert(
+        "post_translation_processors".into(),
+        options.processing.post_translation.join(","),
+    );
+    metadata
+}
+
+fn aggregate_processor_metadata(
+    source_events: &[SourceEvent],
+) -> std::collections::BTreeMap<String, String> {
+    let mut metadata = std::collections::BTreeMap::new();
+    for (source_name, event_name) in [
+        ("stable_hook_key", "stable_hook_keys"),
+        ("text_hook_label", "text_hook_labels"),
+        ("pre_prompt_processors", "pre_prompt_processors"),
+        ("post_translation_processors", "post_translation_processors"),
+    ] {
+        let values = source_events
+            .iter()
+            .filter_map(|event| event.metadata.get(source_name))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            metadata.insert(event_name.into(), values.join(","));
+        }
+    }
+    metadata
+}
+
+fn label_text_input(label: Option<&str>, text: String) -> String {
+    let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+        return text;
+    };
+    serde_json::json!({
+        "text_hook_label": label,
+        "text": text,
+    })
+    .to_string()
 }
 
 fn apply_patch(context: &mut ContextSnapshot, patch: terratranslate_provider::ContextPatch) {
@@ -255,6 +407,8 @@ mod tests {
     use super::*;
 
     struct MockProvider;
+
+    struct LabeledProvider;
 
     #[async_trait]
     impl ModelProvider for MockProvider {
@@ -287,6 +441,44 @@ mod tests {
                 request_id: Some("mock-1".into()),
                 prompt_tokens: Some(10),
                 completion_tokens: Some(4),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for LabeledProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        fn model(&self) -> &str {
+            "mock-text"
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                text: true,
+                tools: true,
+                ..Default::default()
+            }
+        }
+
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+        ) -> Result<TranslationResponse, ProviderError> {
+            let ModelInput::Text(text) = &request.inputs[0] else {
+                panic!("expected a text input");
+            };
+            let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(value["text_hook_label"], "Dialogue");
+            assert_eq!(value["text"], "こんにちは 世界");
+            Ok(TranslationResponse {
+                translated_text: "  Hello world.  ".into(),
+                context_patch: ContextPatch::default(),
+                request_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
             })
         }
     }
@@ -332,6 +524,7 @@ mod tests {
                         source: SourceKind::WineHook,
                         target: "game.exe".into(),
                         input: ModelInput::Text("  こんにちは  ".into()),
+                        text_options: None,
                     },
                     TurnInput {
                         captured_at_ms: 2,
@@ -341,6 +534,7 @@ mod tests {
                             media_type: "image/png".into(),
                             bytes: vec![1, 2],
                         },
+                        text_options: None,
                     },
                     TurnInput {
                         captured_at_ms: 2,
@@ -350,6 +544,7 @@ mod tests {
                             format: "wav".into(),
                             bytes: vec![3, 4],
                         },
+                        text_options: None,
                     },
                 ],
             })
@@ -360,5 +555,88 @@ mod tests {
         assert_eq!(commit.context.scratchpad, "Shiori greeted the player.");
         assert_eq!(commit.scratchpad_edits[0].author, ScratchpadAuthor::Model);
         assert_eq!(engine.store().branch("main").unwrap().head, commit.id);
+    }
+
+    #[tokio::test]
+    async fn applies_and_records_processor_selection_for_a_labeled_text_hook() {
+        let mut engine = TranslationEngine::new(initialized_store(), Arc::new(LabeledProvider));
+        engine.add_processor(Arc::new(NormalizeWhitespace));
+        let commit = engine
+            .translate_turn(TurnRequest {
+                branch: "main".into(),
+                created_at_ms: 2,
+                system_prompt: "Translate".into(),
+                source_language: None,
+                target_language: "English".into(),
+                inputs: vec![TurnInput {
+                    captured_at_ms: 2,
+                    source: SourceKind::WineHook,
+                    target: "wine:42:hook".into(),
+                    input: ModelInput::Text("  こんにちは   世界  ".into()),
+                    text_options: Some(TextInputOptions {
+                        stable_hook_key: Some("wine|game.exe|gdi|dialog".into()),
+                        label: Some(" Dialogue ".into()),
+                        processing: TextProcessingSelection {
+                            pre_prompt: vec!["builtin.normalize_whitespace".into()],
+                            post_translation: vec![],
+                        },
+                    }),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(commit.source_text, "こんにちは 世界");
+        assert_eq!(commit.translated_text, "  Hello world.  ");
+        assert_eq!(
+            commit.source_events[0].metadata["text_hook_label"],
+            "Dialogue"
+        );
+        assert_eq!(
+            commit.source_events[0].metadata["stable_hook_key"],
+            "wine|game.exe|gdi|dialog"
+        );
+        assert_eq!(commit.processor_trace.len(), 1);
+        assert_eq!(
+            commit.processor_trace[0].metadata["stable_hook_key"],
+            "wine|game.exe|gdi|dialog"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_mixed_post_processing_in_one_model_turn() {
+        let mut engine = TranslationEngine::new(initialized_store(), Arc::new(MockProvider));
+        engine.add_processor(Arc::new(NormalizeWhitespace));
+        let input = |post_translation| TurnInput {
+            captured_at_ms: 2,
+            source: SourceKind::WineHook,
+            target: "hook".into(),
+            input: ModelInput::Text("text".into()),
+            text_options: Some(TextInputOptions {
+                stable_hook_key: Some("hook".into()),
+                label: None,
+                processing: TextProcessingSelection {
+                    pre_prompt: vec![],
+                    post_translation,
+                },
+            }),
+        };
+        let result = engine
+            .translate_turn(TurnRequest {
+                branch: "main".into(),
+                created_at_ms: 2,
+                system_prompt: "Translate".into(),
+                source_language: None,
+                target_language: "English".into(),
+                inputs: vec![
+                    input(vec![]),
+                    input(vec!["builtin.normalize_whitespace".into()]),
+                ],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::IncompatiblePostProcessing)
+        ));
     }
 }

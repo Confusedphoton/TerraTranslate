@@ -159,11 +159,8 @@ impl LayerShell {
             if (self.is_supported)() == 0 {
                 return None;
             }
-            (self.init_for_window)(window.as_ptr() as *mut gtk::ffi::GtkWindow);
-            (self.set_layer)(
-                window.as_ptr() as *mut gtk::ffi::GtkWindow,
-                GTK_LAYER_SHELL_LAYER_OVERLAY,
-            );
+            (self.init_for_window)(window.as_ptr());
+            (self.set_layer)(window.as_ptr(), GTK_LAYER_SHELL_LAYER_OVERLAY);
         }
         Some(self)
     }

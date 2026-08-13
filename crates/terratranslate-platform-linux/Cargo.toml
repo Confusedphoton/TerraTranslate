@@ -12,9 +12,8 @@ futures-util.workspace = true
 pipewire.workspace = true
 png.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 terratranslate-wine-protocol = { path = "../terratranslate-wine-protocol" }
-
-[dev-dependencies]
 uuid.workspace = true

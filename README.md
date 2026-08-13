@@ -6,9 +6,8 @@ application audio rather than an OCR subsystem.
 
 This repository currently contains the first working architectural slice. The session engine,
 branching/merge store, OpenAI-compatible provider, portal selection, shortcut registration,
-plugin runner, Wine injection helper, and GTK/Relm4 control surface compile and are covered by
-tests. PipeWire frame/audio decoding and the injected text API adapters are the next integration
-layer; they are not represented as finished in the UI.
+plugin runner, generic hook bridge, semantic Linux/Wine text adapters, and GTK/Relm4 control
+surface compile and are covered by tests.
 
 ## Build and run
 
@@ -64,10 +63,21 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
   application data directory.
   On Wayland, it normally remains a movable toplevel; set `TERRATRANSLATE_WAYLAND_OVERLAY=1` to
   explicitly request a compositor-managed layer surface through gtk4-layer-shell instead.
-- Authenticated local Wine bridge protocol and a Windows injector intended to run inside the
-  selected Wine prefix.
+- Authenticated, bounded hook protocol shared by the native preload library and Wine DLL. Native
+  launch intercepts Pango, SDL_ttf 2/3, and Cairo semantic text APIs; Wine interception covers
+  GDI, Uniscribe, and DirectWrite with matching 32-bit/64-bit injector artifacts.
 - GTK4/Relm4 control surface for capture selection, branch creation, capability diagnostics, and
-  versioned user scratchpad edits.
+  versioned user scratchpad edits. The main app discovers individual Wine hook candidates and
+  native AT-SPI text objects, allows any number to be routed to the model, and persists optional
+  per-hook labels plus independent pre-model and post-translation normalization choices.
+
+Semantic hooks are capture-only and cover common text APIs, not every renderer. Glyph-only
+FreeType/Cairo calls, custom GPU atlases, static or secure-exec native binaries, and other custom
+renderers remain supported through direct window vision. Native processes must be launched from
+TerraTranslate (or with the displayed Steam option); attaching an already-running native process
+is not supported. Flatpak intentionally exposes only portal vision and supplemental AT-SPI—use a
+host package for `LD_PRELOAD` launch and Wine attachment. Development builds may override the
+preload artifact with `TERRATRANSLATE_NATIVE_HOOK_LIBRARY`.
 
 See [the architecture document](docs/architecture.md) for component boundaries and remaining
 platform integration work.

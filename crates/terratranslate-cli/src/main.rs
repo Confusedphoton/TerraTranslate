@@ -145,6 +145,7 @@ async fn main() -> Result<()> {
                     source: SourceKind::Manual,
                     target: "cli".into(),
                     input: ModelInput::Text(text),
+                    text_options: None,
                 })
                 .collect::<Vec<_>>();
             for path in image {
@@ -157,6 +158,7 @@ async fn main() -> Result<()> {
                         bytes: fs::read(&path)
                             .with_context(|| format!("read image {}", path.display()))?,
                     },
+                    text_options: None,
                 });
             }
             for path in audio {
@@ -169,6 +171,7 @@ async fn main() -> Result<()> {
                         bytes: fs::read(&path)
                             .with_context(|| format!("read audio {}", path.display()))?,
                     },
+                    text_options: None,
                 });
             }
             let commit = engine

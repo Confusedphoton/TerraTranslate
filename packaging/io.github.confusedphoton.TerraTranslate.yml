@@ -16,6 +16,8 @@ modules:
     build-commands:
       - cargo --offline build --release -p terratranslate-app --bin terratranslate
       - install -Dm755 target/release/terratranslate /app/bin/terratranslate
+      # Injection is intentionally not installed in Flatpak: the sandbox cannot safely
+      # control arbitrary host processes. Host packages install these artifacts instead.
       - install -Dm644 packaging/io.github.confusedphoton.TerraTranslate.desktop /app/share/applications/io.github.confusedphoton.TerraTranslate.desktop
       - install -Dm644 packaging/io.github.confusedphoton.TerraTranslate.metainfo.xml /app/share/metainfo/io.github.confusedphoton.TerraTranslate.metainfo.xml
     sources:

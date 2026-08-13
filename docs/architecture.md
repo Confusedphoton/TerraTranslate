@@ -4,7 +4,7 @@
 
 ```text
 XDG portal/PipeWire frames ─┐
-Wine hook bridge text ──────┼─> sampling/processors ─> model provider ─> postprocessors
+Native/Wine semantic text ──┼─> sampling/processors ─> model provider ─> postprocessors
 PipeWire application audio ─┘                              │
                                                           v
                                           SQLite commit DAG + blob store
@@ -27,12 +27,14 @@ checked out.
 - `terratranslate-provider`: provider capability negotiation and OpenAI-compatible multimodal/tool
   requests.
 - `terratranslate-engine`: end-to-end versioned translation turns.
-- `terratranslate-platform-linux`: desktop capability detection, ScreenCast and GlobalShortcuts
-  portals, and the authenticated Unix-socket Wine bridge host.
+- `terratranslate-platform-linux`: desktop capability detection, portals, native launcher, Wine
+  process discovery, and the authenticated platform-neutral Unix-socket hook host.
 - `terratranslate-plugin-api` and `terratranslate-plugin-runner`: versioned native processor ABI
   and out-of-process execution.
-- `terratranslate-wine-protocol` and `terratranslate-wine-injector`: shared hook/replacement wire
-  messages and same-prefix DLL injection.
+- `terratranslate-wine-protocol`, `terratranslate-wine-hook`, and
+  `terratranslate-wine-injector`: shared hook messages, GDI/Uniscribe/DirectWrite interception,
+  and architecture-checked same-prefix DLL injection.
+- `terratranslate-native-hook`: launch-time Pango, SDL_ttf 2/3, and Cairo interception.
 - `terratranslate-app`: GTK4/Relm4 control surface and diagnostics CLI.
 
 ## History and merges
@@ -57,10 +59,12 @@ launcher should additionally apply process timeouts, memory limits, and a seccom
 - Per-application playback-node discovery, targeted PCM acquisition, stereo downmixing, and the
   model-facing VAD/segmentation path are implemented; the GTK target picker still needs to expose
   the discovered nodes.
-- Wine injection is implemented; the injected DLL and GDI/Uniscribe/DirectWrite detours are still
-  required before hook events can be emitted.
-- The Wine protocol already models hook candidates, text events, safe replacement capacity,
-  overflow policy, and overlay fallback.
+- Host hooks use stable candidate identities while connection-local UUIDs route explicit producer
+  enable/disable commands. Candidate samples aid discovery, but disabled text never reaches the
+  model. Disconnect removes runtime routing without deleting saved configuration.
+- The GTK app exposes semantic candidates and supplemental native AT-SPI text objects as
+  independently selectable model inputs, including optional labels and ordered per-hook pre/post
+  processors. Contemporaneous hooks with compatible postprocessing are coalesced into one turn.
 - The GTK HUD can switch at runtime between a decorated positioning mode and a frameless overlay
   mode, and can be hidden or shown from the control window. The ordinary Wayland toplevel is the
   default because the compositor can move and resize it while retaining its position when the
