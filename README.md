@@ -59,6 +59,9 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
 - XDG portal window selection, mapped PipeWire frame acquisition, raw RGB conversion to PNG model
   input, application-audio target discovery/capture, and global-shortcut registration.
 - A translation HUD with runtime positioning and frameless overlay modes plus Show/Hide controls.
+  Its background color, text color, background transparency, font family, and font size are
+  configurable live from the control surface and persist in `hud-appearance.json` under the
+  application data directory.
   On Wayland, it normally remains a movable toplevel; set `TERRATRANSLATE_WAYLAND_OVERLAY=1` to
   explicitly request a compositor-managed layer surface through gtk4-layer-shell instead.
 - Authenticated local Wine bridge protocol and a Windows injector intended to run inside the

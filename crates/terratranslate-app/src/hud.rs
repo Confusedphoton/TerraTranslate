@@ -4,6 +4,7 @@ use libloading::Library;
 use relm4::RelmWidgetExt;
 use relm4::gtk;
 use relm4::gtk::prelude::*;
+use serde::{Deserialize, Serialize};
 use terratranslate_platform_linux::{DesktopCapabilities, DisplayServer};
 
 // GLib's gboolean is a 32-bit integer, rather than Rust's one-byte bool.
@@ -14,6 +15,93 @@ type SetLayer = unsafe extern "C" fn(*mut gtk::ffi::GtkWindow, i32);
 const GTK_LAYER_SHELL_LAYER_OVERLAY: i32 = 3;
 const GTK_LAYER_SHELL_LIBRARIES: [&str; 2] = ["libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"];
 const WAYLAND_OVERLAY_ENV: &str = "TERRATRANSLATE_WAYLAND_OVERLAY";
+
+/// User-configurable visual treatment for the translation surface.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HudAppearance {
+    pub background_color: String,
+    pub text_color: String,
+    pub background_opacity: f64,
+    pub font_family: String,
+    pub font_size_pt: f64,
+}
+
+impl Default for HudAppearance {
+    fn default() -> Self {
+        Self {
+            background_color: "#1e1e2e".into(),
+            text_color: "#ffffff".into(),
+            background_opacity: 0.88,
+            font_family: "Sans".into(),
+            font_size_pt: 18.0,
+        }
+    }
+}
+
+impl HudAppearance {
+    pub fn validate(&self) -> Result<(), String> {
+        self.css().map(|_| ())
+    }
+
+    fn css(&self) -> Result<String, String> {
+        let background = parse_hex_color(&self.background_color)?;
+        let text = parse_hex_color(&self.text_color)?;
+        if !(0.0..=1.0).contains(&self.background_opacity) {
+            return Err("background transparency must be between 0% and 100%".into());
+        }
+        if !(6.0..=96.0).contains(&self.font_size_pt) {
+            return Err("font size must be between 6 and 96 pt".into());
+        }
+        let font_family = escape_css_string(&self.font_family);
+        if font_family.is_empty() {
+            return Err("font family cannot be empty".into());
+        }
+
+        Ok(format!(
+            "window.terratranslate-hud, window.terratranslate-hud > .background {{ background-color: transparent; }}\n\
+             .terratranslate-hud-content {{ background-color: rgba({}, {}, {}, {:.3}); }}\n\
+             .terratranslate-hud-text {{ color: rgb({}, {}, {}); font-family: \"{}\"; font-size: {:.1}pt; }}",
+            background.0,
+            background.1,
+            background.2,
+            self.background_opacity,
+            text.0,
+            text.1,
+            text.2,
+            font_family,
+            self.font_size_pt,
+        ))
+    }
+}
+
+fn parse_hex_color(value: &str) -> Result<(u8, u8, u8), String> {
+    let value = value.trim();
+    let hex = value
+        .strip_prefix('#')
+        .ok_or_else(|| "colors must use the #RRGGBB format".to_owned())?;
+    if hex.len() != 6 {
+        return Err("colors must use the #RRGGBB format".into());
+    }
+    let component = |range| {
+        u8::from_str_radix(&hex[range], 16)
+            .map_err(|_| "colors must use hexadecimal #RRGGBB values".to_owned())
+    };
+    Ok((component(0..2)?, component(2..4)?, component(4..6)?))
+}
+
+fn escape_css_string(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .flat_map(|character| match character {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            _ => vec![character],
+        })
+        .collect()
+}
 
 /// Optional layer-shell support keeps the ordinary GTK HUD usable on systems that do not package
 /// gtk4-layer-shell, while allowing Wayland compositors to place the HUD in their overlay layer
@@ -99,11 +187,16 @@ pub(super) fn wayland_overlay_requested() -> bool {
 pub struct HudWindow {
     window: gtk::Window,
     label: gtk::Label,
+    appearance_provider: gtk::CssProvider,
     _layer_shell: Option<LayerShell>,
 }
 
 impl HudWindow {
-    pub fn new(parent: &gtk::ApplicationWindow, capabilities: &DesktopCapabilities) -> Self {
+    pub fn new(
+        parent: &gtk::ApplicationWindow,
+        capabilities: &DesktopCapabilities,
+        appearance: &HudAppearance,
+    ) -> Self {
         let label = gtk::Label::new(None);
         label.set_wrap(true);
         label.set_selectable(true);
@@ -113,6 +206,11 @@ impl HudWindow {
         label.set_vexpand(true);
         label.set_margin_all(18);
         label.add_css_class("title-2");
+        label.add_css_class("terratranslate-hud-text");
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.add_css_class("terratranslate-hud-content");
+        content.append(&label);
 
         let window = gtk::Window::builder()
             .title("TerraTranslate HUD")
@@ -121,7 +219,8 @@ impl HudWindow {
             .resizable(true)
             .hide_on_close(true)
             .build();
-        window.set_child(Some(&label));
+        window.add_css_class("terratranslate-hud");
+        window.set_child(Some(&content));
         window.set_application(parent.application().as_ref());
         window.set_transient_for(Some(parent));
         window.set_destroy_with_parent(true);
@@ -149,6 +248,18 @@ impl HudWindow {
         };
         label.set_text(message);
 
+        let appearance_provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().expect("GTK display is available"),
+            &appearance_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        appearance_provider.load_from_data(
+            &appearance
+                .css()
+                .expect("default or persisted HUD appearance must be valid"),
+        );
+
         // Presenting gives the HUD an initial raise. The transient relationship keeps it above
         // the control window on compositors that honor transient stacking, while retaining the
         // regular toplevel semantics required for Wayland move/resize support.
@@ -157,6 +268,7 @@ impl HudWindow {
         Self {
             window,
             label,
+            appearance_provider,
             _layer_shell: layer_shell,
         }
     }
@@ -202,5 +314,31 @@ impl HudWindow {
 
     pub fn set_message(&self, message: &str) {
         self.label.set_text(message);
+    }
+
+    pub fn set_appearance(&self, appearance: &HudAppearance) -> Result<(), String> {
+        self.appearance_provider.load_from_data(&appearance.css()?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HudAppearance;
+
+    #[test]
+    fn appearance_generates_css_for_valid_values() {
+        let css = HudAppearance::default().css().expect("default is valid");
+        assert!(css.contains("rgba(30, 30, 46, 0.880)"));
+        assert!(css.contains("font-size: 18.0pt"));
+    }
+
+    #[test]
+    fn appearance_rejects_invalid_color() {
+        let appearance = HudAppearance {
+            text_color: "white".into(),
+            ..HudAppearance::default()
+        };
+        assert!(appearance.css().is_err());
     }
 }

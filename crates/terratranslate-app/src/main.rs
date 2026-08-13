@@ -23,7 +23,7 @@ use terratranslate_store::SessionStore;
 
 mod hud;
 
-use hud::{HudWindow, available_layer_shell_library, wayland_overlay_requested};
+use hud::{HudAppearance, HudWindow, available_layer_shell_library, wayland_overlay_requested};
 
 const LAYER_SHELL_PRELOAD_ATTEMPTED: &str = "TERRATRANSLATE_LAYER_SHELL_PRELOAD_ATTEMPTED";
 
@@ -44,6 +44,8 @@ struct Arguments {
 struct AppInit {
     store: SessionStore,
     capabilities: DesktopCapabilities,
+    hud_appearance: HudAppearance,
+    hud_appearance_path: PathBuf,
 }
 
 struct AppModel {
@@ -62,6 +64,8 @@ struct AppModel {
     hud: HudWindow,
     hud_positioning: bool,
     hud_visible: bool,
+    hud_appearance: HudAppearance,
+    hud_appearance_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -71,6 +75,11 @@ enum AppMsg {
     ToggleHudPositioning,
     ToggleHudVisibility,
     HudVisibilityChanged(bool),
+    HudBackgroundColorChanged(String),
+    HudTextColorChanged(String),
+    HudOpacityChanged(f64),
+    HudFontFamilyChanged(String),
+    HudFontSizeChanged(f64),
     BranchInput(String),
     CreateBranch,
     ScratchpadInput(String),
@@ -155,6 +164,77 @@ impl Component for AppModel {
                     set_wrap: true,
                     set_halign: gtk::Align::Start,
                     add_css_class: "dim-label",
+                },
+
+                gtk::Frame {
+                    set_label: Some("HUD appearance"),
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 8,
+                        set_margin_all: 8,
+
+                        gtk::Label {
+                            set_label: "Background",
+                        },
+                        gtk::Entry {
+                            set_width_chars: 8,
+                            set_text: &model.hud_appearance.background_color,
+                            set_tooltip_text: Some("Hex color, for example #1e1e2e"),
+                            connect_changed[sender] => move |entry| {
+                                sender.input(AppMsg::HudBackgroundColorChanged(entry.text().to_string()));
+                            },
+                        },
+                        gtk::Label {
+                            set_label: "Text",
+                        },
+                        gtk::Entry {
+                            set_width_chars: 8,
+                            set_text: &model.hud_appearance.text_color,
+                            set_tooltip_text: Some("Hex color, for example #ffffff"),
+                            connect_changed[sender] => move |entry| {
+                                sender.input(AppMsg::HudTextColorChanged(entry.text().to_string()));
+                            },
+                        },
+                        gtk::Label {
+                            set_label: "Transparency",
+                        },
+                        gtk::Scale {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_range: (0.0, 100.0),
+                            set_value: (1.0 - model.hud_appearance.background_opacity) * 100.0,
+                            set_digits: 0,
+                            set_draw_value: true,
+                            set_width_request: 150,
+                            set_hexpand: true,
+                            set_tooltip_text: Some("0% is opaque; 100% is fully transparent"),
+                            connect_value_changed[sender] => move |scale| {
+                                sender.input(AppMsg::HudOpacityChanged(1.0 - scale.value() / 100.0));
+                            },
+                        },
+                        gtk::Label {
+                            set_label: "Font",
+                        },
+                        gtk::Entry {
+                            set_width_chars: 12,
+                            set_text: &model.hud_appearance.font_family,
+                            set_tooltip_text: Some("Installed font family, for example Sans"),
+                            connect_changed[sender] => move |entry| {
+                                sender.input(AppMsg::HudFontFamilyChanged(entry.text().to_string()));
+                            },
+                        },
+                        gtk::Label {
+                            set_label: "Size (pt)",
+                        },
+                        gtk::SpinButton {
+                            set_range: (6.0, 96.0),
+                            set_increments: (1.0, 4.0),
+                            set_value: model.hud_appearance.font_size_pt,
+                            set_numeric: true,
+                            connect_value_changed[sender] => move |spin_button| {
+                                sender.input(AppMsg::HudFontSizeChanged(spin_button.value()));
+                            },
+                        },
+                    },
                 },
 
                 gtk::Paned {
@@ -255,7 +335,7 @@ impl Component for AppModel {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let display = format!("{:?}", init.capabilities.display_server);
-        let hud = HudWindow::new(&root, &init.capabilities);
+        let hud = HudWindow::new(&root, &init.capabilities, &init.hud_appearance);
         let hud_positioning = hud.supports_positioning();
         let hud_visible = hud.is_visible();
         let visibility_input = sender.input_sender().clone();
@@ -278,6 +358,8 @@ impl Component for AppModel {
             hud,
             hud_positioning,
             hud_visible,
+            hud_appearance: init.hud_appearance,
+            hud_appearance_path: init.hud_appearance_path,
         };
         model.refresh_branches();
         let widgets = view_output!();
@@ -348,6 +430,21 @@ impl Component for AppModel {
                 }
             }
             AppMsg::HudVisibilityChanged(visible) => self.hud_visible = visible,
+            AppMsg::HudBackgroundColorChanged(value) => self.change_hud_appearance(|appearance| {
+                appearance.background_color = value;
+            }),
+            AppMsg::HudTextColorChanged(value) => self.change_hud_appearance(|appearance| {
+                appearance.text_color = value;
+            }),
+            AppMsg::HudOpacityChanged(value) => self.change_hud_appearance(|appearance| {
+                appearance.background_opacity = value;
+            }),
+            AppMsg::HudFontFamilyChanged(value) => self.change_hud_appearance(|appearance| {
+                appearance.font_family = value;
+            }),
+            AppMsg::HudFontSizeChanged(value) => self.change_hud_appearance(|appearance| {
+                appearance.font_size_pt = value;
+            }),
             AppMsg::BranchInput(value) => self.branch_input = value,
             AppMsg::CreateBranch => {
                 let result = self.store.branch(&self.active_branch).and_then(|branch| {
@@ -441,6 +538,21 @@ impl Component for AppModel {
 }
 
 impl AppModel {
+    fn change_hud_appearance(&mut self, change: impl FnOnce(&mut HudAppearance)) {
+        let mut appearance = self.hud_appearance.clone();
+        change(&mut appearance);
+        if let Err(error) = self.hud.set_appearance(&appearance) {
+            self.status = format!("HUD appearance was not changed: {error}");
+            return;
+        }
+        if let Err(error) = save_hud_appearance(&self.hud_appearance_path, &appearance) {
+            self.status = format!("HUD appearance changed, but could not be saved: {error}");
+        } else {
+            self.status = "HUD appearance updated.".into();
+        }
+        self.hud_appearance = appearance;
+    }
+
     fn refresh_branches(&mut self) {
         self.branches = match self.store.list_branches() {
             Ok(branches) => branches
@@ -540,6 +652,27 @@ fn initialize_store(data_dir: &PathBuf) -> Result<SessionStore> {
     Ok(store)
 }
 
+fn load_hud_appearance(path: &PathBuf) -> Result<HudAppearance> {
+    match fs::read(path) {
+        Ok(contents) => {
+            let appearance: HudAppearance =
+                serde_json::from_slice(&contents).context("parse HUD appearance")?;
+            appearance
+                .validate()
+                .map_err(anyhow::Error::msg)
+                .context("validate HUD appearance")?;
+            Ok(appearance)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HudAppearance::default()),
+        Err(error) => Err(error).context("read HUD appearance"),
+    }
+}
+
+fn save_hud_appearance(path: &PathBuf, appearance: &HudAppearance) -> Result<()> {
+    let contents = serde_json::to_vec_pretty(appearance).context("serialize HUD appearance")?;
+    fs::write(path, contents).context("write HUD appearance")
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -559,10 +692,20 @@ fn main() -> Result<()> {
             .join("terratranslate")
     });
     let store = initialize_store(&data_dir)?;
+    let hud_appearance_path = data_dir.join("hud-appearance.json");
+    let hud_appearance = match load_hud_appearance(&hud_appearance_path) {
+        Ok(appearance) => appearance,
+        Err(error) => {
+            tracing::warn!("could not load HUD appearance; using defaults: {error:#}");
+            HudAppearance::default()
+        }
+    };
     let app = RelmApp::new("io.github.confusedphoton.TerraTranslate");
     app.run::<AppModel>(AppInit {
         store,
         capabilities,
+        hud_appearance,
+        hud_appearance_path,
     });
     Ok(())
 }
