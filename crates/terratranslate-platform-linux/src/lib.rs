@@ -2,6 +2,7 @@
 
 mod capabilities;
 mod capture;
+mod native_accessibility;
 mod pipewire_audio;
 mod pipewire_video;
 mod shortcuts;
@@ -9,6 +10,7 @@ mod wine_bridge;
 
 pub use capabilities::*;
 pub use capture::*;
+pub use native_accessibility::*;
 pub use pipewire_audio::*;
 pub use pipewire_video::*;
 pub use shortcuts::*;

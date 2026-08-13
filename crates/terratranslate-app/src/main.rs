@@ -1,6 +1,9 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,8 +19,10 @@ use terratranslate_core::{
     ContextSnapshot, ModelMetadata, ScratchpadAuthor, ScratchpadEdit, TranslationCommit,
 };
 use terratranslate_platform_linux::{
-    DesktopCapabilities, DisplayServer, PortalFrameReceiver, PortalShortcutSession, PortalStream,
-    ShortcutBinding, WindowCaptureSession, register_shortcuts, select_window,
+    DesktopCapabilities, DisplayServer, NativeApplication, NativeTextHookEvent,
+    NativeTextHookService, PortalFrameReceiver, PortalShortcutSession, PortalStream,
+    ShortcutBinding, WindowCaptureSession, WineHookEvent, WineHookService,
+    list_native_applications, register_shortcuts, select_window,
 };
 use terratranslate_store::SessionStore;
 
@@ -46,6 +51,9 @@ struct AppInit {
     capabilities: DesktopCapabilities,
     hud_appearance: HudAppearance,
     hud_appearance_path: PathBuf,
+    wine_hook_service: WineHookService,
+    wine_bridge_config_path: PathBuf,
+    native_text_hook_service: NativeTextHookService,
 }
 
 struct AppModel {
@@ -66,6 +74,13 @@ struct AppModel {
     hud_visible: bool,
     hud_appearance: HudAppearance,
     hud_appearance_path: PathBuf,
+    wine_hook_service: WineHookService,
+    wine_bridge_config_path: PathBuf,
+    wine_hook_status: String,
+    native_text_hook_service: NativeTextHookService,
+    native_application_id: String,
+    native_hook_status: String,
+    native_applications: String,
 }
 
 #[derive(Debug)]
@@ -85,6 +100,10 @@ enum AppMsg {
     ScratchpadInput(String),
     CommitScratchpad,
     PollFrame,
+    PollWineHook,
+    NativeApplicationId(String),
+    PollNativeTextHook,
+    RefreshNativeApplications,
 }
 
 #[derive(Debug)]
@@ -92,6 +111,7 @@ enum CommandOutput {
     Capture(Result<(WindowCaptureSession, PortalFrameReceiver), String>),
     Shortcut(Result<PortalShortcutSession, String>),
     FrameEncoded(Result<EncodedFrame, String>),
+    NativeApplications(Result<Vec<NativeApplication>, String>),
 }
 
 #[derive(Debug)]
@@ -285,19 +305,55 @@ impl Component for AppModel {
                         gtk::Frame {
                             set_label: Some("Source"),
                             set_vexpand: true,
-                            gtk::Label {
-                                #[watch]
-                                set_label: &if model.capture_streams.is_empty() {
-                                    "Choose a window to establish a direct PipeWire frame stream.\nHook text and application audio will join the same timestamped turn.".to_owned()
-                                } else {
-                                    model.capture_streams.iter().map(|stream| format!(
-                                        "PipeWire node {} — {:?} at {:?}", stream.pipewire_node_id, stream.size, stream.position
-                                    )).collect::<Vec<_>>().join("\n")
-                                },
-                                set_wrap: true,
-                                set_halign: gtk::Align::Start,
-                                set_valign: gtk::Align::Start,
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 6,
                                 set_margin_all: 12,
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &if model.capture_streams.is_empty() {
+                                        "Choose a window to establish a direct PipeWire frame stream.".to_owned()
+                                    } else {
+                                        model.capture_streams.iter().map(|stream| format!(
+                                            "PipeWire node {} — {:?} at {:?}", stream.pipewire_node_id, stream.size, stream.position
+                                        )).collect::<Vec<_>>().join("\n")
+                                    },
+                                    set_wrap: true,
+                                    set_halign: gtk::Align::Start,
+                                },
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &model.wine_hook_status,
+                                    set_wrap: true,
+                                    set_halign: gtk::Align::Start,
+                                    add_css_class: "dim-label",
+                                },
+                                gtk::Entry {
+                                    set_placeholder_text: Some("Native AT-SPI application ID"),
+                                    set_tooltip_text: Some("The selected native application's AT-SPI unique bus name"),
+                                    connect_changed[sender] => move |entry| {
+                                        sender.input(AppMsg::NativeApplicationId(entry.text().to_string()));
+                                    },
+                                },
+                                gtk::Button {
+                                    set_label: "List native applications",
+                                    connect_clicked => AppMsg::RefreshNativeApplications,
+                                },
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &model.native_applications,
+                                    set_selectable: true,
+                                    set_wrap: true,
+                                    set_halign: gtk::Align::Start,
+                                    add_css_class: "dim-label",
+                                },
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &model.native_hook_status,
+                                    set_wrap: true,
+                                    set_halign: gtk::Align::Start,
+                                    add_css_class: "dim-label",
+                                },
                             },
                         },
                         gtk::Frame {
@@ -360,12 +416,36 @@ impl Component for AppModel {
             hud_visible,
             hud_appearance: init.hud_appearance,
             hud_appearance_path: init.hud_appearance_path,
+            wine_hook_service: init.wine_hook_service,
+            wine_hook_status: format!(
+                "Wine text hook listening. Configure the injected bridge with {}.",
+                init.wine_bridge_config_path.display()
+            ),
+            native_text_hook_service: init.native_text_hook_service,
+            native_application_id: String::new(),
+            native_hook_status: "Native text hook is connecting to AT-SPI. Enter an application ID to enable capture.".into(),
+            native_applications: String::new(),
+            wine_bridge_config_path: init.wine_bridge_config_path,
         };
         model.refresh_branches();
         let widgets = view_output!();
         let input = sender.input_sender().clone();
         gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
             match input.send(AppMsg::PollFrame) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match input.send(AppMsg::PollWineHook) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match input.send(AppMsg::PollNativeTextHook) {
                 Ok(()) => gtk::glib::ControlFlow::Continue,
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
@@ -487,6 +567,26 @@ impl Component for AppModel {
                     });
                 }
             }
+            AppMsg::PollWineHook => self.poll_wine_hook(),
+            AppMsg::NativeApplicationId(application_id) => {
+                self.native_application_id = application_id;
+                self.native_text_hook_service
+                    .select_application(Some(self.native_application_id.clone()));
+                self.native_hook_status = if self.native_application_id.trim().is_empty() {
+                    "Native text capture disabled until an AT-SPI application ID is selected."
+                        .into()
+                } else {
+                    format!("Native text hook armed for {}.", self.native_application_id)
+                };
+            }
+            AppMsg::PollNativeTextHook => self.poll_native_text_hook(),
+            AppMsg::RefreshNativeApplications => sender.oneshot_command(async {
+                CommandOutput::NativeApplications(
+                    list_native_applications()
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            }),
         }
     }
 
@@ -533,11 +633,110 @@ impl Component for AppModel {
                 self.frame_encoding = false;
                 self.status = format!("Could not encode captured frame: {error}");
             }
+            CommandOutput::NativeApplications(Ok(applications)) => {
+                self.native_applications = if applications.is_empty() {
+                    "No native applications are currently exposed through AT-SPI.".into()
+                } else {
+                    applications
+                        .into_iter()
+                        .map(|application| format!("{} — {}", application.name, application.id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.status =
+                    "Listed native AT-SPI applications. Copy an ID into the native hook field."
+                        .into();
+            }
+            CommandOutput::NativeApplications(Err(error)) => {
+                self.native_applications = format!("Could not list native applications: {error}");
+                self.status = self.native_applications.clone();
+            }
         }
     }
 }
 
 impl AppModel {
+    fn poll_native_text_hook(&mut self) {
+        while let Ok(event) = self.native_text_hook_service.try_recv() {
+            match event {
+                NativeTextHookEvent::Ready => {
+                    self.native_hook_status = if self.native_application_id.trim().is_empty() {
+                        "Native text hook ready. Enter an AT-SPI application ID to enable capture."
+                            .into()
+                    } else {
+                        format!("Native text hook armed for {}.", self.native_application_id)
+                    };
+                }
+                NativeTextHookEvent::Text(event) => {
+                    self.native_hook_status = format!(
+                        "Hooked native text from {} ({}) at {}.",
+                        event.application_id, event.object_path, event.timestamp_ms
+                    );
+                    self.status = format!("{} {}", self.native_hook_status, event.text);
+                    self.hud.set_message(&event.text);
+                }
+                NativeTextHookEvent::Error(error) => {
+                    self.native_hook_status = format!("Native text hook unavailable: {error}");
+                    self.status = self.native_hook_status.clone();
+                }
+            }
+        }
+    }
+
+    fn poll_wine_hook(&mut self) {
+        while let Ok(event) = self.wine_hook_service.try_recv() {
+            match event {
+                WineHookEvent::Connected {
+                    process_id,
+                    executable,
+                } => {
+                    self.wine_hook_status =
+                        format!("Wine text hook attached to {executable} (PID {process_id}).");
+                    self.status = self.wine_hook_status.clone();
+                }
+                WineHookEvent::Text {
+                    process_id,
+                    executable,
+                    event,
+                } => {
+                    let speaker = event
+                        .speaker
+                        .as_deref()
+                        .map(|speaker| format!("{speaker}: "))
+                        .unwrap_or_default();
+                    self.wine_hook_status = format!(
+                        "Hooked text from {executable} (PID {process_id}), event {}.",
+                        event.sequence
+                    );
+                    self.status = format!("{} {speaker}{}", self.wine_hook_status, event.text);
+                    self.hud.set_message(&format!("{speaker}{}", event.text));
+                }
+                WineHookEvent::Diagnostic {
+                    process_id,
+                    executable,
+                    level,
+                    message,
+                } => {
+                    self.status =
+                        format!("Wine bridge {executable} (PID {process_id}) {level}: {message}");
+                }
+                WineHookEvent::Disconnected {
+                    process_id,
+                    executable,
+                } => {
+                    self.wine_hook_status = format!(
+                        "Wine text hook disconnected from {executable} (PID {process_id}). Configure the bridge at {}.",
+                        self.wine_bridge_config_path.display()
+                    );
+                    self.status = self.wine_hook_status.clone();
+                }
+                WineHookEvent::Error(error) => {
+                    self.status = format!("Wine text hook error: {error}")
+                }
+            }
+        }
+    }
+
     fn change_hud_appearance(&mut self, change: impl FnOnce(&mut HudAppearance)) {
         let mut appearance = self.hud_appearance.clone();
         change(&mut appearance);
@@ -673,6 +872,87 @@ fn save_hud_appearance(path: &PathBuf, appearance: &HudAppearance) -> Result<()>
     fs::write(path, contents).context("write HUD appearance")
 }
 
+#[derive(serde::Serialize)]
+struct WineBridgeConfig<'a> {
+    socket_path: &'a str,
+    authentication_token_hex: String,
+}
+
+fn start_wine_hook(data_dir: &PathBuf) -> Result<(WineHookService, PathBuf)> {
+    let socket_path = data_dir.join("wine-bridge.sock");
+    let config_path = data_dir.join("wine-bridge.json");
+    clear_stale_wine_socket(&socket_path)?;
+    let mut authentication_token = [0_u8; 32];
+    fs::File::open("/dev/urandom")
+        .context("open system random source for Wine bridge authentication")?
+        .read_exact(&mut authentication_token)
+        .context("read Wine bridge authentication token")?;
+    let service = WineHookService::bind(&socket_path, authentication_token)
+        .with_context(|| format!("listen for Wine hooks at {}", socket_path.display()))?;
+    let socket_path_string = service.socket_path().display().to_string();
+    let config = WineBridgeConfig {
+        socket_path: &socket_path_string,
+        authentication_token_hex: authentication_token
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    };
+    let mut config_file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&config_path)
+        .with_context(|| format!("create Wine bridge configuration {}", config_path.display()))?;
+    config_file
+        .write_all(&serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("write Wine bridge configuration {}", config_path.display()))?;
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "restrict Wine bridge configuration {}",
+            config_path.display()
+        )
+    })?;
+    Ok((service, config_path))
+}
+
+fn clear_stale_wine_socket(socket_path: &PathBuf) -> Result<()> {
+    match UnixStream::connect(socket_path) {
+        Ok(_) => anyhow::bail!(
+            "another TerraTranslate instance is already listening for Wine hooks at {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(socket_path)
+                .with_context(|| format!("remove stale Wine hook socket {}", socket_path.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("check Wine hook socket {}", socket_path.display()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod wine_hook_startup_tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    #[test]
+    fn removes_a_refused_wine_hook_socket() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "terratranslate-stale-{}-{}.sock",
+            std::process::id(),
+            now_ms()
+        ));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+        clear_stale_wine_socket(&socket_path).unwrap();
+        assert!(!socket_path.exists());
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -692,6 +972,8 @@ fn main() -> Result<()> {
             .join("terratranslate")
     });
     let store = initialize_store(&data_dir)?;
+    let (wine_hook_service, wine_bridge_config_path) = start_wine_hook(&data_dir)?;
+    let native_text_hook_service = NativeTextHookService::start();
     let hud_appearance_path = data_dir.join("hud-appearance.json");
     let hud_appearance = match load_hud_appearance(&hud_appearance_path) {
         Ok(appearance) => appearance,
@@ -706,6 +988,9 @@ fn main() -> Result<()> {
         capabilities,
         hud_appearance,
         hud_appearance_path,
+        wine_hook_service,
+        wine_bridge_config_path,
+        native_text_hook_service,
     });
     Ok(())
 }
