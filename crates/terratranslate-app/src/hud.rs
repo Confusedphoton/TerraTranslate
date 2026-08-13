@@ -10,10 +10,11 @@ type InitLayerShell = unsafe extern "C" fn(*mut gtk::ffi::GtkWindow);
 type SetLayer = unsafe extern "C" fn(*mut gtk::ffi::GtkWindow, i32);
 
 const GTK_LAYER_SHELL_LAYER_OVERLAY: i32 = 3;
+const GTK_LAYER_SHELL_LIBRARIES: [&str; 2] = ["libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"];
 
-/// Dynamically loaded layer-shell support keeps the ordinary GTK HUD usable on systems that do
-/// not package gtk4-layer-shell, while allowing Wayland compositors to place the HUD in their
-/// overlay layer when the optional runtime is present.
+/// Optional layer-shell support keeps the ordinary GTK HUD usable on systems that do not package
+/// gtk4-layer-shell, while allowing Wayland compositors to place the HUD in their overlay layer
+/// when startup has preloaded the runtime.
 struct LayerShell {
     _library: Library,
     is_supported: IsLayerShellSupported,
@@ -22,8 +23,17 @@ struct LayerShell {
 }
 
 impl LayerShell {
+    fn available_library() -> Option<&'static str> {
+        GTK_LAYER_SHELL_LIBRARIES.into_iter().find(|library_name| {
+            // SAFETY: This only probes whether an optional system library can be loaded. The
+            // handle is dropped immediately; startup re-executes with the selected library
+            // preloaded before GTK initializes.
+            unsafe { Library::new(*library_name).is_ok() }
+        })
+    }
+
     fn load() -> Option<Self> {
-        ["libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"]
+        GTK_LAYER_SHELL_LIBRARIES
             .into_iter()
             .find_map(|library_name| {
                 // SAFETY: Loading an optional, system-provided shared library is isolated to the
@@ -66,6 +76,10 @@ impl LayerShell {
         }
         Some(self)
     }
+}
+
+pub(super) fn available_layer_shell_library() -> Option<&'static str> {
+    LayerShell::available_library()
 }
 
 /// A standalone translation surface.

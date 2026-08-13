@@ -1,5 +1,9 @@
+use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,14 +16,16 @@ use terratranslate_core::{
     ContextSnapshot, ModelMetadata, ScratchpadAuthor, ScratchpadEdit, TranslationCommit,
 };
 use terratranslate_platform_linux::{
-    DesktopCapabilities, PortalFrameReceiver, PortalShortcutSession, PortalStream, ShortcutBinding,
-    WindowCaptureSession, register_shortcuts, select_window,
+    DesktopCapabilities, DisplayServer, PortalFrameReceiver, PortalShortcutSession, PortalStream,
+    ShortcutBinding, WindowCaptureSession, register_shortcuts, select_window,
 };
 use terratranslate_store::SessionStore;
 
 mod hud;
 
-use hud::HudWindow;
+use hud::{HudWindow, available_layer_shell_library};
+
+const LAYER_SHELL_PRELOAD_ATTEMPTED: &str = "TERRATRANSLATE_LAYER_SHELL_PRELOAD_ATTEMPTED";
 
 #[derive(Parser)]
 #[command(
@@ -505,6 +511,9 @@ fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&capabilities)?);
         return Ok(());
     }
+    if restart_with_layer_shell_preloaded(&capabilities)? {
+        return Ok(());
+    }
     let data_dir = arguments.data_dir.unwrap_or_else(|| {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -517,4 +526,30 @@ fn main() -> Result<()> {
         capabilities,
     });
     Ok(())
+}
+
+/// gtk4-layer-shell interposes Wayland client requests, so it must be loaded before
+/// libwayland-client. Re-executing here keeps it optional while satisfying that ordering.
+fn restart_with_layer_shell_preloaded(capabilities: &DesktopCapabilities) -> Result<bool> {
+    if capabilities.display_server != DisplayServer::Wayland
+        || env::var_os(LAYER_SHELL_PRELOAD_ATTEMPTED).is_some()
+    {
+        return Ok(false);
+    }
+    let Some(layer_shell_library) = available_layer_shell_library() else {
+        return Ok(false);
+    };
+
+    let mut preload = OsString::from(layer_shell_library);
+    if let Some(existing_preload) = env::var_os("LD_PRELOAD") {
+        preload.push(":");
+        preload.push(existing_preload);
+    }
+
+    let error = Command::new(env::current_exe().context("resolve the TerraTranslate executable")?)
+        .args(env::args_os().skip(1))
+        .env("LD_PRELOAD", preload)
+        .env(LAYER_SHELL_PRELOAD_ATTEMPTED, "1")
+        .exec();
+    Err(error).context("restart TerraTranslate with gtk4-layer-shell preloaded")
 }
