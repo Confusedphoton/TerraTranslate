@@ -58,9 +58,9 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
 - Ordered built-in processors plus a crash-isolated native plugin ABI and runner.
 - XDG portal window selection, mapped PipeWire frame acquisition, raw RGB conversion to PNG model
   input, application-audio target discovery/capture, and global-shortcut registration.
-- A standalone, resizable translation HUD on X11 and Wayland. Wayland uses a manual-positioning
-  fallback and opportunistically requests the compositor overlay layer when gtk4-layer-shell is
-  installed.
+- A translation HUD with runtime positioning and frameless overlay modes plus Show/Hide controls.
+  On Wayland, it normally remains a movable toplevel; set `TERRATRANSLATE_WAYLAND_OVERLAY=1` to
+  explicitly request a compositor-managed layer surface through gtk4-layer-shell instead.
 - Authenticated local Wine bridge protocol and a Windows injector intended to run inside the
   selected Wine prefix.
 - GTK4/Relm4 control surface for capture selection, branch creation, capability diagnostics, and

@@ -1,3 +1,5 @@
+use std::env;
+
 use libloading::Library;
 use relm4::RelmWidgetExt;
 use relm4::gtk;
@@ -11,6 +13,7 @@ type SetLayer = unsafe extern "C" fn(*mut gtk::ffi::GtkWindow, i32);
 
 const GTK_LAYER_SHELL_LAYER_OVERLAY: i32 = 3;
 const GTK_LAYER_SHELL_LIBRARIES: [&str; 2] = ["libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"];
+const WAYLAND_OVERLAY_ENV: &str = "TERRATRANSLATE_WAYLAND_OVERLAY";
 
 /// Optional layer-shell support keeps the ordinary GTK HUD usable on systems that do not package
 /// gtk4-layer-shell, while allowing Wayland compositors to place the HUD in their overlay layer
@@ -82,6 +85,12 @@ pub(super) fn available_layer_shell_library() -> Option<&'static str> {
     LayerShell::available_library()
 }
 
+/// Layer-shell surfaces are not ordinary toplevels, so compositors do not generally provide their
+/// normal move and resize controls. Keep that behavior an explicit user choice.
+pub(super) fn wayland_overlay_requested() -> bool {
+    env::var_os(WAYLAND_OVERLAY_ENV).is_some_and(|value| value == "1")
+}
+
 /// A standalone translation surface.
 ///
 /// This intentionally remains a normal GTK top-level window. That gives Wayland users a
@@ -117,7 +126,9 @@ impl HudWindow {
         window.set_transient_for(Some(parent));
         window.set_destroy_with_parent(true);
 
-        let layer_shell = if capabilities.display_server == DisplayServer::Wayland {
+        let layer_shell = if capabilities.display_server == DisplayServer::Wayland
+            && wayland_overlay_requested()
+        {
             LayerShell::load().and_then(|layer_shell| layer_shell.configure(&window))
         } else {
             None
@@ -126,13 +137,13 @@ impl HudWindow {
         let message = match capabilities.display_server {
             DisplayServer::Wayland => {
                 if layer_shell.is_some() {
-                    "Translations will stream here.\n\nWayland HUD: compositor overlay layer requested.\nResize behavior is compositor-dependent."
+                    "Translations will stream here.\n\nWayland HUD: compositor overlay layer requested.\nLayer surfaces are not manually movable or resizable."
                 } else {
-                    "Translations will stream here.\n\nWayland HUD: move or resize this window manually.\nInstall gtk4-layer-shell for a compositor overlay-layer request."
+                    "Translations will stream here.\n\nWayland HUD: move or resize this window, then choose Use as overlay."
                 }
             }
             DisplayServer::X11 => {
-                "Translations will stream here.\n\nX11 HUD: move or resize this window as needed."
+                "Translations will stream here.\n\nX11 HUD: move or resize this window, then choose Use as overlay."
             }
             DisplayServer::Unknown => "No graphical session is available for the translation HUD.",
         };
@@ -152,6 +163,41 @@ impl HudWindow {
 
     pub fn present(&self) {
         self.window.present();
+    }
+
+    pub fn hide(&self) {
+        self.window.set_visible(false);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.window.is_visible()
+    }
+
+    /// Switch between a decorated window for placement and a frameless translation overlay.
+    ///
+    /// A Wayland layer surface cannot be converted back into a regular movable toplevel after it
+    /// has been realized. The ordinary Wayland HUD and the X11 HUD can change modes in place, so
+    /// their compositor-managed position and size are retained.
+    pub fn set_positioning(&self, positioning: bool) -> bool {
+        if !self.supports_positioning() {
+            return false;
+        }
+        self.window.set_decorated(positioning);
+        self.window.set_resizable(positioning);
+        self.window.present();
+        true
+    }
+
+    pub fn supports_positioning(&self) -> bool {
+        self._layer_shell.is_none()
+    }
+
+    pub fn connect_visible_changed<F>(&self, callback: F)
+    where
+        F: Fn(bool) + 'static,
+    {
+        self.window
+            .connect_visible_notify(move |window| callback(window.is_visible()));
     }
 
     pub fn set_message(&self, message: &str) {

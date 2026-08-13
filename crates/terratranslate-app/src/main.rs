@@ -23,7 +23,7 @@ use terratranslate_store::SessionStore;
 
 mod hud;
 
-use hud::{HudWindow, available_layer_shell_library};
+use hud::{HudWindow, available_layer_shell_library, wayland_overlay_requested};
 
 const LAYER_SHELL_PRELOAD_ATTEMPTED: &str = "TERRATRANSLATE_LAYER_SHELL_PRELOAD_ATTEMPTED";
 
@@ -60,13 +60,17 @@ struct AppModel {
     shortcut_registration_pending: bool,
     frame_encoding: bool,
     hud: HudWindow,
+    hud_positioning: bool,
+    hud_visible: bool,
 }
 
 #[derive(Debug)]
 enum AppMsg {
     SelectWindow,
     RegisterShortcut,
-    ShowHud,
+    ToggleHudPositioning,
+    ToggleHudVisibility,
+    HudVisibilityChanged(bool),
     BranchInput(String),
     CreateBranch,
     ScratchpadInput(String),
@@ -126,8 +130,22 @@ impl Component for AppModel {
                         connect_clicked => AppMsg::RegisterShortcut,
                     },
                     gtk::Button {
-                        set_label: "Show HUD",
-                        connect_clicked => AppMsg::ShowHud,
+                        #[watch]
+                        set_label: if model.hud_positioning { "Use as overlay" } else { "Position HUD" },
+                        #[watch]
+                        set_sensitive: model.hud.supports_positioning(),
+                        #[watch]
+                        set_tooltip_text: if model.hud.supports_positioning() {
+                            Some("Toggle the HUD frame and resize controls")
+                        } else {
+                            Some("Wayland layer surfaces are positioned by the compositor")
+                        },
+                        connect_clicked => AppMsg::ToggleHudPositioning,
+                    },
+                    gtk::Button {
+                        #[watch]
+                        set_label: if model.hud_visible { "Hide HUD" } else { "Show HUD" },
+                        connect_clicked => AppMsg::ToggleHudVisibility,
                     },
                 },
 
@@ -238,6 +256,12 @@ impl Component for AppModel {
     ) -> ComponentParts<Self> {
         let display = format!("{:?}", init.capabilities.display_server);
         let hud = HudWindow::new(&root, &init.capabilities);
+        let hud_positioning = hud.supports_positioning();
+        let hud_visible = hud.is_visible();
+        let visibility_input = sender.input_sender().clone();
+        hud.connect_visible_changed(move |visible| {
+            let _ = visibility_input.send(AppMsg::HudVisibilityChanged(visible));
+        });
         let mut model = Self {
             store: init.store,
             status: format!("Desktop: {display}. Ready."),
@@ -252,6 +276,8 @@ impl Component for AppModel {
             shortcut_registration_pending: false,
             frame_encoding: false,
             hud,
+            hud_positioning,
+            hud_visible,
         };
         model.refresh_branches();
         let widgets = view_output!();
@@ -308,7 +334,20 @@ impl Component for AppModel {
                     )
                 });
             }
-            AppMsg::ShowHud => self.hud.present(),
+            AppMsg::ToggleHudPositioning => {
+                let positioning = !self.hud_positioning;
+                if self.hud.set_positioning(positioning) {
+                    self.hud_positioning = positioning;
+                }
+            }
+            AppMsg::ToggleHudVisibility => {
+                if self.hud_visible {
+                    self.hud.hide();
+                } else {
+                    self.hud.present();
+                }
+            }
+            AppMsg::HudVisibilityChanged(visible) => self.hud_visible = visible,
             AppMsg::BranchInput(value) => self.branch_input = value,
             AppMsg::CreateBranch => {
                 let result = self.store.branch(&self.active_branch).and_then(|branch| {
@@ -532,6 +571,7 @@ fn main() -> Result<()> {
 /// libwayland-client. Re-executing here keeps it optional while satisfying that ordering.
 fn restart_with_layer_shell_preloaded(capabilities: &DesktopCapabilities) -> Result<bool> {
     if capabilities.display_server != DisplayServer::Wayland
+        || !wayland_overlay_requested()
         || env::var_os(LAYER_SHELL_PRELOAD_ATTEMPTED).is_some()
     {
         return Ok(false);

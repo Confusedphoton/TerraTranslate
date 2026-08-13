@@ -61,10 +61,11 @@ launcher should additionally apply process timeouts, memory limits, and a seccom
   required before hook events can be emitted.
 - The Wine protocol already models hook candidates, text events, safe replacement capacity,
   overflow policy, and overlay fallback.
-- The GTK HUD is a standalone, resizable top-level window on both supported display servers. On
-  Wayland it is the deliberate fallback when target-relative coordinates are unavailable: the
-  user can move and resize it manually. If `gtk4-layer-shell` is installed and the compositor
-  supports it, the HUD requests the overlay layer so it starts above normal application windows;
-  the base Wayland protocol cannot guarantee that behavior for an ordinary top-level window.
+- The GTK HUD can switch at runtime between a decorated positioning mode and a frameless overlay
+  mode, and can be hidden or shown from the control window. The ordinary Wayland toplevel is the
+  default because the compositor can move and resize it while retaining its position when the
+  decorations are removed. Setting `TERRATRANSLATE_WAYLAND_OVERLAY=1` explicitly requests the
+  overlay layer through `gtk4-layer-shell`; such layer surfaces are compositor-positioned and
+  therefore cannot enter the manual positioning mode.
 - X11 passive-grab and target-relative overlay backends remain separate from the portal-based
   Wayland path.
