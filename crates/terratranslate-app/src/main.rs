@@ -51,6 +51,8 @@ struct AppModel {
     capture_session: Option<WindowCaptureSession>,
     frame_receiver: Option<PortalFrameReceiver>,
     shortcut_session: Option<PortalShortcutSession>,
+    shortcut_registration_pending: bool,
+    frame_encoding: bool,
     hud: HudWindow,
 }
 
@@ -70,6 +72,15 @@ enum AppMsg {
 enum CommandOutput {
     Capture(Result<(WindowCaptureSession, PortalFrameReceiver), String>),
     Shortcut(Result<PortalShortcutSession, String>),
+    FrameEncoded(Result<EncodedFrame, String>),
+}
+
+#[derive(Debug)]
+struct EncodedFrame {
+    width: u32,
+    height: u32,
+    format: String,
+    png_bytes: usize,
 }
 
 #[relm4::component]
@@ -104,6 +115,8 @@ impl Component for AppModel {
                     },
                     gtk::Button {
                         set_label: "Claim shortcut",
+                        #[watch]
+                        set_sensitive: !model.shortcut_registration_pending && model.shortcut_session.is_none(),
                         connect_clicked => AppMsg::RegisterShortcut,
                     },
                     gtk::Button {
@@ -230,6 +243,8 @@ impl Component for AppModel {
             capture_session: None,
             frame_receiver: None,
             shortcut_session: None,
+            shortcut_registration_pending: false,
+            frame_encoding: false,
             hud,
         };
         model.refresh_branches();
@@ -269,6 +284,10 @@ impl Component for AppModel {
                 });
             }
             AppMsg::RegisterShortcut => {
+                if self.shortcut_registration_pending || self.shortcut_session.is_some() {
+                    return;
+                }
+                self.shortcut_registration_pending = true;
                 self.status = "Waiting for compositor shortcut approval…".into();
                 sender.oneshot_command(async {
                     let bindings = [ShortcutBinding {
@@ -303,19 +322,27 @@ impl Component for AppModel {
             AppMsg::ScratchpadInput(value) => self.scratchpad_input = value,
             AppMsg::CommitScratchpad => self.commit_scratchpad(),
             AppMsg::PollFrame => {
-                if let Some(receiver) = &self.frame_receiver
-                    && let Ok(frame) = receiver.try_recv()
+                if !self.frame_encoding
+                    && let Some(receiver) = &self.frame_receiver
+                    && let Ok(frame) = receiver.try_recv_latest()
                 {
-                    self.status = match frame.encode_png() {
-                        Ok(png) => format!(
-                            "Live capture: {}×{} {:?} frame encoded to {} bytes of PNG model input.",
-                            frame.width,
-                            frame.height,
-                            frame.format,
-                            png.len()
-                        ),
-                        Err(error) => format!("Could not encode captured frame: {error}"),
-                    };
+                    self.frame_encoding = true;
+                    sender.spawn_oneshot_command(move || {
+                        let width = frame.width;
+                        let height = frame.height;
+                        let format = format!("{:?}", frame.format);
+                        CommandOutput::FrameEncoded(
+                            frame
+                                .encode_png()
+                                .map(|png| EncodedFrame {
+                                    width,
+                                    height,
+                                    format,
+                                    png_bytes: png.len(),
+                                })
+                                .map_err(|error| error.to_string()),
+                        )
+                    });
                 }
             }
         }
@@ -345,11 +372,24 @@ impl Component for AppModel {
                 self.status = format!("Window capture unavailable: {error}")
             }
             CommandOutput::Shortcut(Ok(session)) => {
+                self.shortcut_registration_pending = false;
                 self.status = format!("Claimed shortcuts: {}", session.accepted_ids().join(", "));
                 self.shortcut_session = Some(session);
             }
             CommandOutput::Shortcut(Err(error)) => {
+                self.shortcut_registration_pending = false;
                 self.status = format!("Shortcut unavailable: {error}")
+            }
+            CommandOutput::FrameEncoded(Ok(frame)) => {
+                self.frame_encoding = false;
+                self.status = format!(
+                    "Live capture: {}×{} {} frame encoded to {} bytes of PNG model input.",
+                    frame.width, frame.height, frame.format, frame.png_bytes
+                );
+            }
+            CommandOutput::FrameEncoded(Err(error)) => {
+                self.frame_encoding = false;
+                self.status = format!("Could not encode captured frame: {error}");
             }
         }
     }

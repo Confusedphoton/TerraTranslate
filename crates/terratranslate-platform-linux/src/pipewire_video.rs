@@ -130,6 +130,18 @@ impl PortalFrameReceiver {
         self.frames.try_recv()
     }
 
+    /// Return the most recent available frame without waiting.
+    ///
+    /// The application only needs a current visual context. Draining older frames prevents a
+    /// slow consumer from spending time encoding stale video while newer frames keep arriving.
+    pub fn try_recv_latest(&self) -> Result<RawVideoFrame, mpsc::TryRecvError> {
+        let mut latest = self.frames.try_recv()?;
+        while let Ok(frame) = self.frames.try_recv() {
+            latest = frame;
+        }
+        Ok(latest)
+    }
+
     pub fn recv(&self) -> Result<RawVideoFrame, PipeWireVideoError> {
         self.frames.recv().map_err(|_| PipeWireVideoError::Stopped)
     }
@@ -324,5 +336,34 @@ mod tests {
         };
         let encoded = frame.encode_png().unwrap();
         assert_eq!(&encoded[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn receiver_returns_the_newest_queued_frame() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender
+            .send(RawVideoFrame {
+                width: 1,
+                height: 1,
+                stride: 4,
+                format: RawFrameFormat::Rgbx,
+                bytes: vec![0; 4],
+            })
+            .unwrap();
+        sender
+            .send(RawVideoFrame {
+                width: 2,
+                height: 1,
+                stride: 8,
+                format: RawFrameFormat::Rgbx,
+                bytes: vec![0; 8],
+            })
+            .unwrap();
+        let receiver = PortalFrameReceiver {
+            frames: receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert_eq!(receiver.try_recv_latest().unwrap().width, 2);
     }
 }
