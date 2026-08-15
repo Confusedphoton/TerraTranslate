@@ -6,6 +6,8 @@ use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
 use pw::spa::pod::Pod;
+pub use terratranslate_core::FrameCacheConfig as VisionFrameCacheConfig;
+use terratranslate_core::{FrameCacheConfig, structural_similarity as byte_structural_similarity};
 
 static PIPEWIRE_INIT: Once = Once::new();
 
@@ -31,8 +33,7 @@ pub struct RawVideoFrame {
 }
 
 impl RawVideoFrame {
-    /// Convert a mapped raw frame into the lossless format accepted by vision APIs.
-    pub fn encode_png(&self) -> Result<Vec<u8>, PipeWireVideoError> {
+    fn rgba_bytes(&self) -> Result<Vec<u8>, PipeWireVideoError> {
         let input_channels = match self.format {
             RawFrameFormat::Rgb => 3,
             RawFrameFormat::Rgba | RawFrameFormat::Rgbx | RawFrameFormat::Bgrx => 4,
@@ -44,11 +45,17 @@ impl RawVideoFrame {
         } else {
             source_stride
         };
-        if self.bytes.len() < source_stride.saturating_mul(self.height as usize) {
+        let required_bytes = source_stride
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| {
+                PipeWireVideoError::Setup("frame dimensions overflow the source stride".into())
+            })?;
+        if source_stride < packed_stride || self.bytes.len() < required_bytes {
             return Err(PipeWireVideoError::Setup(
                 "frame buffer is shorter than its dimensions".into(),
             ));
         }
+
         let mut rgba = Vec::with_capacity(self.width as usize * self.height as usize * 4);
         for row in 0..self.height as usize {
             let row = if self.stride < 0 {
@@ -67,6 +74,38 @@ impl RawVideoFrame {
                 rgba.extend_from_slice(&[red, green, blue, alpha]);
             }
         }
+        Ok(rgba)
+    }
+
+    fn luma_bytes(&self) -> Result<Vec<u8>, PipeWireVideoError> {
+        Ok(self
+            .rgba_bytes()?
+            .chunks_exact(4)
+            .map(|pixel| {
+                ((u16::from(pixel[0]) * 77
+                    + u16::from(pixel[1]) * 150
+                    + u16::from(pixel[2]) * 29
+                    + 128)
+                    / 256) as u8
+            })
+            .collect())
+    }
+
+    /// Return the SSIM score against another raw frame, normalized to canonical luminance.
+    /// Frames with different dimensions or invalid buffers cannot be reused.
+    pub fn structural_similarity(&self, other: &Self) -> f32 {
+        if self.width != other.width || self.height != other.height {
+            return 0.0;
+        }
+        match (self.luma_bytes(), other.luma_bytes()) {
+            (Ok(first), Ok(second)) => byte_structural_similarity(&first, &second),
+            _ => 0.0,
+        }
+    }
+
+    /// Convert a mapped raw frame into the lossless format accepted by vision APIs.
+    pub fn encode_png(&self) -> Result<Vec<u8>, PipeWireVideoError> {
+        let rgba = self.rgba_bytes()?;
         let mut output = Vec::new();
         let mut encoder = png::Encoder::new(&mut output, self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
@@ -81,6 +120,65 @@ impl RawVideoFrame {
             .finish()
             .map_err(|error| PipeWireVideoError::Setup(error.to_string()))?;
         Ok(output)
+    }
+}
+
+/// Reuses the last accepted raw frame when a new frame exceeds the configured SSIM threshold.
+/// With no threshold, frames pass through without retaining a cache.
+#[derive(Debug)]
+pub struct VisionFrameCache {
+    config: FrameCacheConfig,
+    cached_frame: Option<RawVideoFrame>,
+}
+
+impl VisionFrameCache {
+    pub fn new(config: FrameCacheConfig) -> Self {
+        Self {
+            config,
+            cached_frame: None,
+        }
+    }
+
+    pub fn config(&self) -> FrameCacheConfig {
+        self.config
+    }
+
+    pub fn cached_frame(&self) -> Option<&RawVideoFrame> {
+        self.cached_frame.as_ref()
+    }
+
+    pub fn set_config(&mut self, config: FrameCacheConfig) {
+        if config.normalized_similarity_threshold().is_none() {
+            self.cached_frame = None;
+        }
+        self.config = config;
+    }
+
+    pub fn clear(&mut self) {
+        self.cached_frame = None;
+    }
+
+    /// Return the cached frame for a sufficiently similar candidate, otherwise cache and return
+    /// the candidate. The candidate is never retained when it is replaced by the cache.
+    pub fn select(&mut self, frame: RawVideoFrame) -> RawVideoFrame {
+        let Some(threshold) = self.config.normalized_similarity_threshold() else {
+            return frame;
+        };
+
+        if let Some(cached_frame) = &self.cached_frame
+            && cached_frame.structural_similarity(&frame) >= threshold
+        {
+            return cached_frame.clone();
+        }
+
+        self.cached_frame = Some(frame.clone());
+        frame
+    }
+}
+
+impl Default for VisionFrameCache {
+    fn default() -> Self {
+        Self::new(FrameCacheConfig::disabled())
     }
 }
 
@@ -325,6 +423,16 @@ fn setup_error(error: impl std::fmt::Display) -> PipeWireVideoError {
 mod tests {
     use super::*;
 
+    fn test_frame(value: u8) -> RawVideoFrame {
+        RawVideoFrame {
+            width: 4,
+            height: 8,
+            stride: 12,
+            format: RawFrameFormat::Rgb,
+            bytes: vec![value; 4 * 8 * 3],
+        }
+    }
+
     #[test]
     fn bgrx_frame_encodes_as_png() {
         let frame = RawVideoFrame {
@@ -336,6 +444,54 @@ mod tests {
         };
         let encoded = frame.encode_png().unwrap();
         assert_eq!(&encoded[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn raw_frame_similarity_uses_pixels_instead_of_encoded_bytes() {
+        let mut similar = test_frame(40);
+        similar.bytes[0] = 41;
+        let different = test_frame(255);
+
+        assert_eq!(test_frame(40).structural_similarity(&test_frame(40)), 1.0);
+        assert!(test_frame(40).structural_similarity(&similar) > 0.99);
+        assert!(test_frame(0).structural_similarity(&different) < 0.01);
+        assert_eq!(
+            test_frame(40).structural_similarity(&RawVideoFrame {
+                width: 2,
+                height: 16,
+                ..test_frame(40)
+            }),
+            0.0
+        );
+    }
+
+    #[test]
+    fn vision_frame_cache_reuses_the_prior_frame_above_threshold() {
+        let mut cache = VisionFrameCache::new(FrameCacheConfig::with_similarity_threshold(0.99));
+        let original = test_frame(40);
+        let mut similar = test_frame(40);
+        similar.bytes[0] = 41;
+
+        let selected = cache.select(original.clone());
+        assert_eq!(selected.bytes, original.bytes);
+        let selected = cache.select(similar);
+        assert_eq!(selected.bytes, original.bytes);
+        assert_eq!(cache.cached_frame().unwrap().bytes, original.bytes);
+    }
+
+    #[test]
+    fn vision_frame_cache_stores_dissimilar_frames_and_can_be_disabled() {
+        let mut cache = VisionFrameCache::new(FrameCacheConfig::with_similarity_threshold(0.99));
+        let replacement = test_frame(220);
+        let selected = cache.select(replacement.clone());
+        assert_eq!(selected.bytes, replacement.bytes);
+        assert_eq!(cache.cached_frame().unwrap().bytes, replacement.bytes);
+
+        cache.set_config(FrameCacheConfig::disabled());
+        assert!(cache.cached_frame().is_none());
+        let next = test_frame(40);
+        assert_eq!(cache.select(next.clone()).bytes, next.bytes);
+        assert!(cache.cached_frame().is_none());
     }
 
     #[test]

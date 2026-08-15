@@ -55,7 +55,7 @@ launcher should additionally apply process timeouts, memory limits, and a seccom
 ## Platform completion map
 
 - Portal window permission, PipeWire node discovery, mapped raw video acquisition, PNG conversion,
-  and shortcut binding are implemented.
+  optional SSIM-based reuse of cached vision frames, and shortcut binding are implemented.
 - Per-application playback-node discovery, targeted PCM acquisition, stereo downmixing, and the
   model-facing VAD/segmentation path are implemented; the GTK target picker still needs to expose
   the discovered nodes.

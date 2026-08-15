@@ -28,10 +28,10 @@ use terratranslate_engine::{
 use terratranslate_platform_linux::{
     DesktopCapabilities, DisplayServer, NativeApplication, NativeLaunchRequest,
     NativeTextHookEvent, NativeTextHookService, PortalFrameReceiver, PortalShortcutSession,
-    PortalStream, ShortcutBinding, WindowCaptureSession, WineArtifacts, WineHookEvent,
-    WineHookService, WineTarget, attach_wine_target, discover_wine_targets, launch_native,
-    list_native_applications, parse_native_arguments, register_shortcuts, select_window,
-    steam_launch_option,
+    PortalStream, ShortcutBinding, VisionFrameCache, VisionFrameCacheConfig, WindowCaptureSession,
+    WineArtifacts, WineHookEvent, WineHookService, WineTarget, attach_wine_target,
+    discover_wine_targets, launch_native, list_native_applications, parse_native_arguments,
+    register_shortcuts, select_window, steam_launch_option,
 };
 use terratranslate_provider::{ModelCapabilities, ModelInput, OpenAiCompatibleProvider};
 use terratranslate_store::SessionStore;
@@ -58,6 +58,9 @@ struct Arguments {
     /// Override the application data directory.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Reuse the last captured frame when its SSIM score reaches this value (0.0-1.0).
+    #[arg(long, value_name = "THRESHOLD")]
+    vision_similarity_threshold: Option<f32>,
 }
 
 struct AppInit {
@@ -75,6 +78,7 @@ struct AppInit {
     text_hook_configs_path: PathBuf,
     native_preload_path: PathBuf,
     wine_artifacts: WineArtifacts,
+    vision_cache_config: VisionFrameCacheConfig,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -120,6 +124,7 @@ struct AppModel {
     capture_streams: Vec<PortalStream>,
     capture_session: Option<WindowCaptureSession>,
     frame_receiver: Option<PortalFrameReceiver>,
+    vision_cache: VisionFrameCache,
     shortcut_session: Option<PortalShortcutSession>,
     shortcut_registration_pending: bool,
     frame_encoding: bool,
@@ -199,7 +204,10 @@ enum AppMsg {
 enum CommandOutput {
     Capture(Result<(WindowCaptureSession, PortalFrameReceiver), String>),
     Shortcut(Result<PortalShortcutSession, String>),
-    FrameEncoded(Result<EncodedFrame, String>),
+    FrameEncoded {
+        result: Result<EncodedFrame, String>,
+        cache: VisionFrameCache,
+    },
     NativeApplications(Result<Vec<NativeApplication>, String>),
     WineTargets(Result<Vec<WineTarget>, String>),
     WineAttached(Result<String, String>),
@@ -697,6 +705,7 @@ impl Component for AppModel {
             capture_streams: Vec::new(),
             capture_session: None,
             frame_receiver: None,
+            vision_cache: VisionFrameCache::new(init.vision_cache_config),
             shortcut_session: None,
             shortcut_registration_pending: false,
             frame_encoding: false,
@@ -894,22 +903,24 @@ impl Component for AppModel {
                     && let Some(receiver) = &self.frame_receiver
                     && let Ok(frame) = receiver.try_recv_latest()
                 {
+                    let cache = std::mem::take(&mut self.vision_cache);
                     self.frame_encoding = true;
                     sender.spawn_oneshot_command(move || {
+                        let mut cache = cache;
+                        let frame = cache.select(frame);
                         let width = frame.width;
                         let height = frame.height;
                         let format = format!("{:?}", frame.format);
-                        CommandOutput::FrameEncoded(
-                            frame
-                                .encode_png()
-                                .map(|png| EncodedFrame {
-                                    width,
-                                    height,
-                                    format,
-                                    png_bytes: png.len(),
-                                })
-                                .map_err(|error| error.to_string()),
-                        )
+                        let result = frame
+                            .encode_png()
+                            .map(|png| EncodedFrame {
+                                width,
+                                height,
+                                format,
+                                png_bytes: png.len(),
+                            })
+                            .map_err(|error| error.to_string());
+                        CommandOutput::FrameEncoded { result, cache }
                     });
                 }
             }
@@ -1122,16 +1133,20 @@ impl Component for AppModel {
                 self.shortcut_registration_pending = false;
                 self.status = format!("Shortcut unavailable: {error}")
             }
-            CommandOutput::FrameEncoded(Ok(frame)) => {
+            CommandOutput::FrameEncoded { result, cache } => {
+                self.vision_cache = cache;
                 self.frame_encoding = false;
-                self.status = format!(
-                    "Live capture: {}×{} {} frame encoded to {} bytes of PNG model input.",
-                    frame.width, frame.height, frame.format, frame.png_bytes
-                );
-            }
-            CommandOutput::FrameEncoded(Err(error)) => {
-                self.frame_encoding = false;
-                self.status = format!("Could not encode captured frame: {error}");
+                match result {
+                    Ok(frame) => {
+                        self.status = format!(
+                            "Live capture: {}×{} {} frame encoded to {} bytes of PNG model input.",
+                            frame.width, frame.height, frame.format, frame.png_bytes
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not encode captured frame: {error}");
+                    }
+                }
             }
             CommandOutput::NativeApplications(Ok(applications)) => {
                 self.native_applications = if applications.is_empty() {
@@ -1852,6 +1867,9 @@ fn main() -> Result<()> {
     if restart_with_layer_shell_preloaded(&capabilities)? {
         return Ok(());
     }
+    let vision_cache_config = VisionFrameCacheConfig {
+        similarity_threshold: arguments.vision_similarity_threshold,
+    };
     let data_dir = arguments.data_dir.unwrap_or_else(|| {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1914,6 +1932,7 @@ fn main() -> Result<()> {
         text_hook_configs_path,
         native_preload_path,
         wine_artifacts,
+        vision_cache_config,
     });
     Ok(())
 }

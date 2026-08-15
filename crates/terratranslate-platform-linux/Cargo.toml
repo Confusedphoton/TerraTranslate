@@ -15,5 +15,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+terratranslate-core = { path = "../terratranslate-core" }
 terratranslate-wine-protocol = { path = "../terratranslate-wine-protocol" }
 uuid.workspace = true

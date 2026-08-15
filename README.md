@@ -20,6 +20,13 @@ cargo test --workspace
 cargo run -p terratranslate-app --bin terratranslate
 ```
 
+Live vision capture can optionally reuse the last frame when a new frame's structural similarity
+score reaches a configured threshold. Omit the option to keep exact-frame behavior:
+
+```sh
+cargo run -p terratranslate-app --bin terratranslate -- --vision-similarity-threshold 0.98
+```
+
 Wine/Proton attachment additionally needs the matching Windows artifacts. Install the MinGW Rust
 targets and build both architectures; when the app is run from this checkout it automatically
 checks the corresponding `target/<triple>/<profile>` directories before packaged locations:
