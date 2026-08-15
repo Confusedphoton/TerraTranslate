@@ -140,12 +140,16 @@ struct AppModel {
     wine_attach_available: bool,
     wine_artifacts: WineArtifacts,
     wine_targets: Vec<WineTarget>,
-    wine_target_index: String,
+    wine_target_options: gtk::StringList,
+    wine_target_selection: Option<usize>,
     wine_targets_display: String,
     native_text_hook_service: NativeTextHookService,
     native_application_id: String,
     native_hook_status: String,
-    native_applications: String,
+    native_applications: Vec<NativeApplication>,
+    native_application_options: gtk::StringList,
+    native_application_selection: Option<usize>,
+    native_application_list_status: String,
     native_launch_available: bool,
     native_preload_path: PathBuf,
     native_launch_executable: String,
@@ -185,10 +189,10 @@ enum AppMsg {
     PollFrame,
     PollWineHook,
     RefreshWineTargets,
-    WineTargetIndex(String),
+    WineTargetSelected(u32),
     AttachWineTarget,
     DetachHooks,
-    NativeApplicationId(String),
+    NativeApplicationSelected(u32),
     PollNativeTextHook,
     EndlessContext(bool),
     EndlessContextScratchpad(bool),
@@ -238,468 +242,587 @@ impl Component for AppModel {
     type CommandOutput = CommandOutput;
 
     view! {
-        gtk::ApplicationWindow {
-            set_title: Some("TerraTranslate"),
-            set_default_size: (1100, 800),
+            gtk::ApplicationWindow {
+                set_title: Some("TerraTranslate"),
+                set_default_size: (1100, 800),
 
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 10,
-                set_margin_all: 14,
+                gtk::ScrolledWindow {
+                    set_hexpand: true,
+                    set_vexpand: true,
+                    set_policy: (gtk::PolicyType::Automatic, gtk::PolicyType::Automatic),
+                    set_propagate_natural_width: false,
+                    set_propagate_natural_height: false,
 
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    set_spacing: 8,
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 10,
+                        set_margin_all: 14,
+                        set_hexpand: true,
+
+                        gtk::FlowBox {
+                            set_selection_mode: gtk::SelectionMode::None,
+                            set_column_spacing: 8,
+                            set_row_spacing: 8,
+                            set_homogeneous: false,
+                            set_hexpand: true,
+
+                            gtk::Label {
+                                set_markup: "<span size='x-large' weight='bold'>TerraTranslate</span>",
+                                set_halign: gtk::Align::Start,
+                            },
+                            gtk::Button {
+                                set_label: "Select window",
+                                connect_clicked => AppMsg::SelectWindow,
+                            },
+                            gtk::Button {
+                                set_label: "Claim shortcut",
+                                #[watch]
+                                set_sensitive: !model.shortcut_registration_pending && model.shortcut_session.is_none(),
+                                connect_clicked => AppMsg::RegisterShortcut,
+                            },
+                            gtk::Button {
+                                #[watch]
+                                set_label: if model.hud_positioning { "Use as overlay" } else { "Position HUD" },
+                                #[watch]
+                                set_sensitive: model.hud.supports_positioning(),
+                                #[watch]
+                                set_tooltip_text: if model.hud.supports_positioning() {
+                                    Some("Toggle the HUD frame and resize controls")
+                                } else {
+                                    Some("Wayland layer surfaces are positioned by the compositor")
+                                },
+                                connect_clicked => AppMsg::ToggleHudPositioning,
+                            },
+                            gtk::Button {
+                                #[watch]
+                                set_label: if model.hud_visible { "Hide HUD" } else { "Show HUD" },
+                                connect_clicked => AppMsg::ToggleHudVisibility,
+                            },
+                        },
 
                     gtk::Label {
-                        set_markup: "<span size='x-large' weight='bold'>TerraTranslate</span>",
-                        set_hexpand: true,
+                        #[watch]
+                        set_label: &model.status,
+                        set_wrap: true,
                         set_halign: gtk::Align::Start,
+                        add_css_class: "dim-label",
                     },
-                    gtk::Button {
-                        set_label: "Select window",
-                        connect_clicked => AppMsg::SelectWindow,
-                    },
-                    gtk::Button {
-                        set_label: "Claim shortcut",
-                        #[watch]
-                        set_sensitive: !model.shortcut_registration_pending && model.shortcut_session.is_none(),
-                        connect_clicked => AppMsg::RegisterShortcut,
-                    },
-                    gtk::Button {
-                        #[watch]
-                        set_label: if model.hud_positioning { "Use as overlay" } else { "Position HUD" },
-                        #[watch]
-                        set_sensitive: model.hud.supports_positioning(),
-                        #[watch]
-                        set_tooltip_text: if model.hud.supports_positioning() {
-                            Some("Toggle the HUD frame and resize controls")
-                        } else {
-                            Some("Wayland layer surfaces are positioned by the compositor")
-                        },
-                        connect_clicked => AppMsg::ToggleHudPositioning,
-                    },
-                    gtk::Button {
-                        #[watch]
-                        set_label: if model.hud_visible { "Hide HUD" } else { "Show HUD" },
-                        connect_clicked => AppMsg::ToggleHudVisibility,
-                    },
-                },
 
-                gtk::Label {
-                    #[watch]
-                    set_label: &model.status,
-                    set_wrap: true,
-                    set_halign: gtk::Align::Start,
-                    add_css_class: "dim-label",
-                },
+                        gtk::Frame {
+                            set_label: Some("HUD appearance"),
+                            gtk::FlowBox {
+                                set_selection_mode: gtk::SelectionMode::None,
+                                set_column_spacing: 12,
+                                set_row_spacing: 8,
+                                set_homogeneous: false,
+                                set_margin_all: 8,
 
-                gtk::Frame {
-                    set_label: Some("HUD appearance"),
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 8,
-                        set_margin_all: 8,
-
-                        gtk::Label {
-                            set_label: "Background",
-                        },
-                        gtk::Entry {
-                            set_width_chars: 8,
-                            set_text: &model.hud_appearance.background_color,
-                            set_tooltip_text: Some("Hex color, for example #1e1e2e"),
-                            connect_changed[sender] => move |entry| {
-                                sender.input(AppMsg::HudBackgroundColorChanged(entry.text().to_string()));
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    gtk::Label {
+                                        set_label: "Background",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Entry {
+                                        set_width_chars: 8,
+                                        set_text: &model.hud_appearance.background_color,
+                                        set_tooltip_text: Some("Hex color, for example #1e1e2e"),
+                                        connect_changed[sender] => move |entry| {
+                                            sender.input(AppMsg::HudBackgroundColorChanged(entry.text().to_string()));
+                                        },
+                                    },
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    gtk::Label {
+                                        set_label: "Text",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Entry {
+                                        set_width_chars: 8,
+                                        set_text: &model.hud_appearance.text_color,
+                                        set_tooltip_text: Some("Hex color, for example #ffffff"),
+                                        connect_changed[sender] => move |entry| {
+                                            sender.input(AppMsg::HudTextColorChanged(entry.text().to_string()));
+                                        },
+                                    },
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    set_hexpand: true,
+                                    gtk::Label {
+                                        set_label: "Transparency",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Scale {
+                                        set_orientation: gtk::Orientation::Horizontal,
+                                        set_range: (0.0, 100.0),
+                                        set_value: (1.0 - model.hud_appearance.background_opacity) * 100.0,
+                                        set_digits: 0,
+                                        set_draw_value: true,
+                                        set_hexpand: true,
+                                        set_tooltip_text: Some("0% is opaque; 100% is fully transparent"),
+                                        connect_value_changed[sender] => move |scale| {
+                                            sender.input(AppMsg::HudOpacityChanged(1.0 - scale.value() / 100.0));
+                                        },
+                                    },
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    gtk::Label {
+                                        set_label: "Font",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Entry {
+                                        set_width_chars: 12,
+                                        set_text: &model.hud_appearance.font_family,
+                                        set_tooltip_text: Some("Installed font family, for example Sans"),
+                                        connect_changed[sender] => move |entry| {
+                                            sender.input(AppMsg::HudFontFamilyChanged(entry.text().to_string()));
+                                        },
+                                    },
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    gtk::Label {
+                                        set_label: "Size (pt)",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::SpinButton {
+                                        set_range: (6.0, 96.0),
+                                        set_increments: (1.0, 4.0),
+                                        set_value: model.hud_appearance.font_size_pt,
+                                        set_numeric: true,
+                                        connect_value_changed[sender] => move |spin_button| {
+                                            sender.input(AppMsg::HudFontSizeChanged(spin_button.value()));
+                                        },
+                                    },
+                                },
                             },
                         },
-                        gtk::Label {
-                            set_label: "Text",
-                        },
-                        gtk::Entry {
-                            set_width_chars: 8,
-                            set_text: &model.hud_appearance.text_color,
-                            set_tooltip_text: Some("Hex color, for example #ffffff"),
-                            connect_changed[sender] => move |entry| {
-                                sender.input(AppMsg::HudTextColorChanged(entry.text().to_string()));
-                            },
-                        },
-                        gtk::Label {
-                            set_label: "Transparency",
-                        },
-                        gtk::Scale {
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_range: (0.0, 100.0),
-                            set_value: (1.0 - model.hud_appearance.background_opacity) * 100.0,
-                            set_digits: 0,
-                            set_draw_value: true,
-                            set_width_request: 150,
-                            set_hexpand: true,
-                            set_tooltip_text: Some("0% is opaque; 100% is fully transparent"),
-                            connect_value_changed[sender] => move |scale| {
-                                sender.input(AppMsg::HudOpacityChanged(1.0 - scale.value() / 100.0));
-                            },
-                        },
-                        gtk::Label {
-                            set_label: "Font",
-                        },
-                        gtk::Entry {
-                            set_width_chars: 12,
-                            set_text: &model.hud_appearance.font_family,
-                            set_tooltip_text: Some("Installed font family, for example Sans"),
-                            connect_changed[sender] => move |entry| {
-                                sender.input(AppMsg::HudFontFamilyChanged(entry.text().to_string()));
-                            },
-                        },
-                        gtk::Label {
-                            set_label: "Size (pt)",
-                        },
-                        gtk::SpinButton {
-                            set_range: (6.0, 96.0),
-                            set_increments: (1.0, 4.0),
-                            set_value: model.hud_appearance.font_size_pt,
-                            set_numeric: true,
-                            connect_value_changed[sender] => move |spin_button| {
-                                sender.input(AppMsg::HudFontSizeChanged(spin_button.value()));
-                            },
-                        },
-                    },
-                },
 
                 gtk::Paned {
                     set_orientation: gtk::Orientation::Horizontal,
                     set_position: 300,
                     set_vexpand: true,
+                    set_resize_start_child: true,
+                    set_resize_end_child: true,
+                    set_shrink_start_child: true,
+                    set_shrink_end_child: true,
 
-                    #[wrap(Some)]
-                    set_start_child = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-                        set_spacing: 8,
-                        set_margin_end: 8,
+                        #[wrap(Some)]
+                        set_start_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 8,
+                            set_margin_end: 8,
 
-                        gtk::Label {
-                            set_markup: "<b>Translation history</b>",
-                            set_halign: gtk::Align::Start,
-                        },
-                        gtk::Label {
-                            #[watch]
-                            set_label: &model.branches,
-                            set_selectable: true,
-                            set_halign: gtk::Align::Start,
-                            set_valign: gtk::Align::Start,
-                            set_vexpand: true,
-                        },
-                        gtk::Entry {
-                            set_placeholder_text: Some("New branch name"),
-                            connect_changed[sender] => move |entry| {
-                                sender.input(AppMsg::BranchInput(entry.text().to_string()));
-                            },
-                        },
-                        gtk::Button {
-                            set_label: "Branch from current head",
-                            connect_clicked => AppMsg::CreateBranch,
-                        },
-                    },
-
-                    #[wrap(Some)]
-                    set_end_child = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-                        set_spacing: 8,
-                        set_margin_start: 8,
-
-                        gtk::Label {
-                            set_markup: "<b>Multimodal session</b>",
-                            set_halign: gtk::Align::Start,
-                        },
-                        gtk::Frame {
-                            set_label: Some("Model"),
-                            gtk::Grid {
-                                set_column_spacing: 8,
-                                set_row_spacing: 6,
-                                set_margin_all: 8,
-
-                                attach[0, 0, 1, 1] = &gtk::Label {
-                                    set_label: "Endpoint",
-                                    set_halign: gtk::Align::End,
-                                },
-                                attach[1, 0, 1, 1] = &gtk::Entry {
-                                    set_hexpand: true,
-                                    set_text: &model.model_settings.endpoint,
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(AppMsg::ModelEndpoint(entry.text().to_string()));
-                                    },
-                                },
-                                attach[0, 1, 1, 1] = &gtk::Label {
-                                    set_label: "Model",
-                                    set_halign: gtk::Align::End,
-                                },
-                                attach[1, 1, 1, 1] = &gtk::Entry {
-                                    set_hexpand: true,
-                                    set_placeholder_text: Some("Required model name"),
-                                    set_text: &model.model_settings.model,
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(AppMsg::ModelName(entry.text().to_string()));
-                                    },
-                                },
-                                attach[2, 0, 1, 1] = &gtk::Label {
-                                    set_label: "Source language",
-                                    set_halign: gtk::Align::End,
-                                },
-                                attach[3, 0, 1, 1] = &gtk::Entry {
-                                    set_placeholder_text: Some("Source: auto-detect"),
-                                    set_text: &model.model_settings.source_language,
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(AppMsg::SourceLanguage(entry.text().to_string()));
-                                    },
-                                },
-                                attach[2, 1, 1, 1] = &gtk::Label {
-                                    set_label: "Target language",
-                                    set_halign: gtk::Align::End,
-                                },
-                                attach[3, 1, 1, 1] = &gtk::Entry {
-                                    set_placeholder_text: Some("Target language"),
-                                    set_text: &model.model_settings.target_language,
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(AppMsg::TargetLanguage(entry.text().to_string()));
-                                    },
-                                },
-                            },
-                        },
-                        gtk::Frame {
-                            set_label: Some("Context for next request"),
-                            gtk::Box {
-                                set_orientation: gtk::Orientation::Vertical,
-                                set_spacing: 4,
-                                set_margin_all: 8,
-                                gtk::CheckButton {
-                                    set_label: Some("Endless context"),
-                                    #[watch]
-                                    set_active: model.endless_context_pending,
-                                    set_tooltip_text: Some("Send the complete main branch context once, then clear this option"),
-                                    connect_toggled[sender] => move |button| {
-                                        sender.input(AppMsg::EndlessContext(button.is_active()));
-                                    },
-                                },
-                                gtk::CheckButton {
-                                    set_label: Some("Re-insert scratchpad for this request"),
-                                    #[watch]
-                                    set_active: model.endless_context_include_scratchpad,
-                                    #[watch]
-                                    set_sensitive: model.endless_context_pending,
-                                    set_tooltip_text: Some("Include the current scratchpad only in this request; historical scratchpads are never replayed"),
-                                    connect_toggled[sender] => move |button| {
-                                        sender.input(AppMsg::EndlessContextScratchpad(button.is_active()));
-                                    },
-                                },
-                                gtk::Label {
-                                    set_label: "Without the scratchpad option, scratchpad text is omitted and remains empty in the resulting context.",
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                            },
-                        },
-                        gtk::Frame {
-                            set_label: Some("Source"),
-                            set_vexpand: true,
-                            gtk::Box {
-                                set_orientation: gtk::Orientation::Vertical,
-                                set_spacing: 6,
-                                set_margin_all: 12,
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &if model.capture_streams.is_empty() {
-                                        "Choose a window to establish a direct PipeWire frame stream.".to_owned()
-                                    } else {
-                                        model.capture_streams.iter().map(|stream| format!(
-                                            "PipeWire node {} — {:?} at {:?}", stream.pipewire_node_id, stream.size, stream.position
-                                        )).collect::<Vec<_>>().join("\n")
-                                    },
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                },
-                                gtk::Frame {
-                                    set_label: Some("Launch native application with semantic hooks"),
-                                    gtk::Grid {
-                                        set_column_spacing: 8,
-                                        set_row_spacing: 6,
-                                        set_margin_all: 8,
-
-                                        attach[0, 0, 1, 1] = &gtk::Label {
-                                            set_label: "Executable",
-                                            set_halign: gtk::Align::End,
-                                        },
-                                        attach[1, 0, 3, 1] = &gtk::Entry {
-                                            set_hexpand: true,
-                                            set_placeholder_text: Some("/path/to/application"),
-                                            #[watch]
-                                            set_sensitive: model.native_launch_available,
-                                            connect_changed[sender] => move |entry| {
-                                                sender.input(AppMsg::NativeLaunchExecutable(entry.text().to_string()));
-                                            },
-                                        },
-                                        attach[0, 1, 1, 1] = &gtk::Label {
-                                            set_label: "Arguments",
-                                            set_halign: gtk::Align::End,
-                                        },
-                                        attach[1, 1, 3, 1] = &gtk::Entry {
-                                            set_placeholder_text: Some("Quoted arguments are supported; no shell is invoked"),
-                                            #[watch]
-                                            set_sensitive: model.native_launch_available,
-                                            connect_changed[sender] => move |entry| {
-                                                sender.input(AppMsg::NativeLaunchArguments(entry.text().to_string()));
-                                            },
-                                        },
-                                        attach[0, 2, 1, 1] = &gtk::Label {
-                                            set_label: "Working directory",
-                                            set_halign: gtk::Align::End,
-                                        },
-                                        attach[1, 2, 2, 1] = &gtk::Entry {
-                                            set_placeholder_text: Some("Defaults to the executable directory"),
-                                            #[watch]
-                                            set_sensitive: model.native_launch_available,
-                                            connect_changed[sender] => move |entry| {
-                                                sender.input(AppMsg::NativeLaunchWorkingDirectory(entry.text().to_string()));
-                                            },
-                                        },
-                                        attach[3, 2, 1, 1] = &gtk::Button {
-                                            set_label: "Launch",
-                                            #[watch]
-                                            set_sensitive: model.native_launch_available && !model.native_launch_executable.trim().is_empty(),
-                                            connect_clicked => AppMsg::LaunchNative,
-                                        },
-                                        attach[0, 3, 4, 1] = &gtk::Label {
-                                            #[watch]
-                                            set_label: &model.native_launch_status,
-                                            set_selectable: true,
-                                            set_wrap: true,
-                                            set_halign: gtk::Align::Start,
-                                            add_css_class: "dim-label",
-                                        },
-                                    },
-                                },
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.wine_hook_status,
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                                gtk::Box {
-                                    set_orientation: gtk::Orientation::Horizontal,
-                                    set_spacing: 8,
-                                    gtk::Button {
-                                        set_label: "Refresh Wine targets",
-                                        #[watch]
-                                        set_sensitive: model.wine_attach_available,
-                                        connect_clicked => AppMsg::RefreshWineTargets,
-                                    },
-                                    gtk::Entry {
-                                        set_width_chars: 5,
-                                        set_placeholder_text: Some("Row"),
-                                        set_tooltip_text: Some("One-based row number from the Wine target list"),
-                                        #[watch]
-                                        set_sensitive: model.wine_attach_available,
-                                        connect_changed[sender] => move |entry| {
-                                            sender.input(AppMsg::WineTargetIndex(entry.text().to_string()));
-                                        },
-                                    },
-                                    gtk::Button {
-                                        set_label: "Attach selected Wine target",
-                                        #[watch]
-                                        set_sensitive: model.wine_attach_available && !model.wine_targets.is_empty(),
-                                        connect_clicked => AppMsg::AttachWineTarget,
-                                    },
-                                    gtk::Button {
-                                        set_label: "Detach hooks",
-                                        #[watch]
-                                        set_sensitive: !model.hook_routes.is_empty(),
-                                        connect_clicked => AppMsg::DetachHooks,
-                                    },
-                                },
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.wine_targets_display,
-                                    set_selectable: true,
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                                gtk::Entry {
-                                    set_placeholder_text: Some("Native AT-SPI application ID"),
-                                    set_tooltip_text: Some("The selected native application's AT-SPI unique bus name"),
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(AppMsg::NativeApplicationId(entry.text().to_string()));
-                                    },
-                                },
-                                gtk::Button {
-                                    set_label: "List native applications",
-                                    connect_clicked => AppMsg::RefreshNativeApplications,
-                                },
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.native_applications,
-                                    set_selectable: true,
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.native_hook_status,
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                                gtk::Label {
-                                    set_markup: "<b>Discovered text hooks</b>",
-                                    set_halign: gtk::Align::Start,
-                                },
-                                gtk::Label {
-                                    set_label: "Enable any number of hooks. Labels and normalization are configured independently for each hook.",
-                                    set_wrap: true,
-                                    set_halign: gtk::Align::Start,
-                                    add_css_class: "dim-label",
-                                },
-                                gtk::ScrolledWindow {
-                                    set_min_content_height: 180,
-                                    set_vexpand: true,
-                                    set_hscrollbar_policy: gtk::PolicyType::Never,
-
-                                    #[local_ref]
-                                    text_hook_list -> gtk::ListBox {
-                                        set_selection_mode: gtk::SelectionMode::None,
-                                    },
-                                },
-                            },
-                        },
-                        gtk::Frame {
-                            set_label: Some("Translation HUD preview"),
-                            set_vexpand: true,
                             gtk::Label {
-                                set_markup: "<span size='large'>Translations will stream here.</span>",
-                                set_wrap: true,
-                                set_margin_all: 12,
+                                set_markup: "<b>Translation history</b>",
+                                set_halign: gtk::Align::Start,
+                            },
+                            gtk::Label {
+                                #[watch]
+                                set_label: &model.branches,
+                                set_selectable: true,
+                                set_halign: gtk::Align::Start,
+                                set_valign: gtk::Align::Start,
+                                set_vexpand: true,
+                            },
+                            gtk::Entry {
+                                set_placeholder_text: Some("New branch name"),
+                                connect_changed[sender] => move |entry| {
+                                    sender.input(AppMsg::BranchInput(entry.text().to_string()));
+                                },
+                            },
+                            gtk::Button {
+                                set_label: "Branch from current head",
+                                connect_clicked => AppMsg::CreateBranch,
                             },
                         },
-                        gtk::Label {
-                            set_markup: "<b>Versioned scratchpad</b>",
-                            set_halign: gtk::Align::Start,
-                        },
-                        gtk::Entry {
-                            set_placeholder_text: Some("Model and user notes are committed to the DAG"),
-                            connect_changed[sender] => move |entry| {
-                                sender.input(AppMsg::ScratchpadInput(entry.text().to_string()));
+
+                        #[wrap(Some)]
+                        set_end_child = &gtk::ScrolledWindow {
+                            set_hexpand: true,
+                            set_vexpand: true,
+                            set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                            set_propagate_natural_width: false,
+                            set_propagate_natural_height: false,
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 8,
+                                set_margin_start: 8,
+                                set_margin_end: 4,
+
+                                gtk::Label {
+                                    set_markup: "<b>Multimodal session</b>",
+                                    set_halign: gtk::Align::Start,
+                                },
+                            gtk::Frame {
+                                set_label: Some("Model"),
+                                gtk::FlowBox {
+                                    set_selection_mode: gtk::SelectionMode::None,
+                                    set_column_spacing: 12,
+                                    set_row_spacing: 8,
+                                    set_homogeneous: false,
+                                    set_margin_all: 8,
+
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "Endpoint",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_text: &model.model_settings.endpoint,
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::ModelEndpoint(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "Model",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_placeholder_text: Some("Required model name"),
+                                            set_text: &model.model_settings.model,
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::ModelName(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "Source language",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_placeholder_text: Some("Source: auto-detect"),
+                                            set_text: &model.model_settings.source_language,
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::SourceLanguage(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "Target language",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_placeholder_text: Some("Target language"),
+                                            set_text: &model.model_settings.target_language,
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::TargetLanguage(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
+                                },
                             },
-                        },
-                        gtk::Button {
-                            set_label: "Commit user scratchpad edit",
-                            connect_clicked => AppMsg::CommitScratchpad,
+                            gtk::Frame {
+                                set_label: Some("Context for next request"),
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    set_margin_all: 8,
+                                    gtk::CheckButton {
+                                        set_label: Some("Endless context"),
+                                        #[watch]
+                                        set_active: model.endless_context_pending,
+                                        set_tooltip_text: Some("Send the complete main branch context once, then clear this option"),
+                                        connect_toggled[sender] => move |button| {
+                                            sender.input(AppMsg::EndlessContext(button.is_active()));
+                                        },
+                                    },
+                                    gtk::CheckButton {
+                                        set_label: Some("Re-insert scratchpad for this request"),
+                                        #[watch]
+                                        set_active: model.endless_context_include_scratchpad,
+                                        #[watch]
+                                        set_sensitive: model.endless_context_pending,
+                                        set_tooltip_text: Some("Include the current scratchpad only in this request; historical scratchpads are never replayed"),
+                                        connect_toggled[sender] => move |button| {
+                                            sender.input(AppMsg::EndlessContextScratchpad(button.is_active()));
+                                        },
+                                    },
+                                    gtk::Label {
+                                        set_label: "Without the scratchpad option, scratchpad text is omitted and remains empty in the resulting context.",
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                },
+                            },
+                            gtk::Frame {
+                                set_label: Some("Source"),
+                                set_vexpand: true,
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 6,
+                                    set_margin_all: 12,
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &if model.capture_streams.is_empty() {
+                                            "Choose a window to establish a direct PipeWire frame stream.".to_owned()
+                                        } else {
+                                            model.capture_streams.iter().map(|stream| format!(
+                                                "PipeWire node {} — {:?} at {:?}", stream.pipewire_node_id, stream.size, stream.position
+                                            )).collect::<Vec<_>>().join("\n")
+                                        },
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Frame {
+                                        set_label: Some("Launch native application with semantic hooks"),
+                                        gtk::Box {
+                                            set_orientation: gtk::Orientation::Vertical,
+                                            set_spacing: 4,
+                                            set_margin_all: 8,
+
+                                            gtk::Label {
+                                                set_label: "Executable",
+                                            },
+                                            gtk::Entry {
+                                                set_hexpand: true,
+                                                set_placeholder_text: Some("/path/to/application"),
+                                                #[watch]
+                                                set_sensitive: model.native_launch_available,
+                                                connect_changed[sender] => move |entry| {
+                                                    sender.input(AppMsg::NativeLaunchExecutable(entry.text().to_string()));
+                                                },
+                                            },
+                                            gtk::Label {
+                                                set_label: "Arguments",
+                                            },
+                                            gtk::Entry {
+                                                set_placeholder_text: Some("Quoted arguments are supported; no shell is invoked"),
+                                                #[watch]
+                                                set_sensitive: model.native_launch_available,
+                                                connect_changed[sender] => move |entry| {
+                                                    sender.input(AppMsg::NativeLaunchArguments(entry.text().to_string()));
+                                                },
+                                            },
+                                            gtk::Label {
+                                                set_label: "Working directory",
+                                            },
+                                            gtk::FlowBox {
+                                                set_selection_mode: gtk::SelectionMode::None,
+                                                set_column_spacing: 8,
+                                                set_row_spacing: 4,
+                                                set_homogeneous: false,
+                                                set_hexpand: true,
+                                                gtk::Entry {
+                                                    set_hexpand: true,
+                                                    set_placeholder_text: Some("Defaults to the executable directory"),
+                                                    #[watch]
+                                                    set_sensitive: model.native_launch_available,
+                                                    connect_changed[sender] => move |entry| {
+                                                        sender.input(AppMsg::NativeLaunchWorkingDirectory(entry.text().to_string()));
+                                                    },
+                                                },
+                                                gtk::Button {
+                                                    set_label: "Launch",
+                                                    #[watch]
+                                                    set_sensitive: model.native_launch_available && !model.native_launch_executable.trim().is_empty(),
+                                                    connect_clicked => AppMsg::LaunchNative,
+                                                },
+                                            },
+                                            gtk::Label {
+                                                #[watch]
+                                                set_label: &model.native_launch_status,
+                                                set_selectable: true,
+                                                set_wrap: true,
+                                                set_halign: gtk::Align::Start,
+                                                add_css_class: "dim-label",
+                                            },
+                                        },
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &model.wine_hook_status,
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::Label {
+                                        set_label: "Wine/Proton target",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::FlowBox {
+                                        set_selection_mode: gtk::SelectionMode::None,
+                                        set_column_spacing: 8,
+                                        set_row_spacing: 8,
+                                        set_homogeneous: false,
+                                        set_hexpand: true,
+                                        gtk::Button {
+                                            set_label: "Refresh Wine targets",
+                                            #[watch]
+                                            set_sensitive: model.wine_attach_available,
+                                            connect_clicked => AppMsg::RefreshWineTargets,
+                                        },
+                                        gtk::DropDown {
+                                            set_model: Some(&model.wine_target_options),
+                                            #[watch]
+                                            set_selected: model.wine_target_selection
+                                                .map(|index| index as u32 + 1)
+                                                .unwrap_or(0),
+                                            set_enable_search: true,
+                                            set_hexpand: true,
+                                            set_tooltip_text: Some("Choose a discovered Wine/Proton process"),
+                                            #[watch]
+                                            set_sensitive: model.wine_attach_available && !model.wine_targets.is_empty(),
+                                            connect_selected_notify[sender] => move |drop_down| {
+                                                sender.input(AppMsg::WineTargetSelected(drop_down.selected()));
+                                            },
+                                        },
+                                        gtk::Button {
+                                            set_label: "Attach selected Wine target",
+                                            #[watch]
+                                            set_sensitive: model.wine_attach_available && model.wine_target_selection.is_some(),
+                                            connect_clicked => AppMsg::AttachWineTarget,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Detach hooks",
+                                            #[watch]
+                                            set_sensitive: !model.hook_routes.is_empty(),
+                                            connect_clicked => AppMsg::DetachHooks,
+                                        },
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &model.wine_targets_display,
+                                        set_selectable: true,
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::Label {
+                                        set_label: "Native application",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::FlowBox {
+                                        set_selection_mode: gtk::SelectionMode::None,
+                                        set_column_spacing: 8,
+                                        set_row_spacing: 8,
+                                        set_homogeneous: false,
+                                        set_hexpand: true,
+                                        gtk::Button {
+                                            set_label: "Refresh native applications",
+                                            connect_clicked => AppMsg::RefreshNativeApplications,
+                                        },
+                                        gtk::DropDown {
+                                            set_model: Some(&model.native_application_options),
+                                            #[watch]
+                                            set_selected: model.native_application_selection
+                                                .map(|index| index as u32 + 1)
+                                                .unwrap_or(0),
+                                            set_enable_search: true,
+                                            set_hexpand: true,
+                                            set_tooltip_text: Some("Choose the native application to capture through AT-SPI"),
+                                            #[watch]
+                                            set_sensitive: !model.native_applications.is_empty(),
+                                            connect_selected_notify[sender] => move |drop_down| {
+                                                sender.input(AppMsg::NativeApplicationSelected(drop_down.selected()));
+                                            },
+                                        },
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &model.native_application_list_status,
+                                        set_selectable: true,
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &model.selected_native_application_summary(),
+                                        set_selectable: true,
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: &model.native_hook_status,
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::Label {
+                                        set_markup: "<b>Discovered text hooks</b>",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Label {
+                                        set_label: "Enable any number of hooks. Labels and normalization are configured independently for each hook.",
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
+                                    gtk::ScrolledWindow {
+                                        set_min_content_height: 180,
+                                        set_vexpand: true,
+                                        set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                                        #[local_ref]
+                                        text_hook_list -> gtk::ListBox {
+                                            set_selection_mode: gtk::SelectionMode::None,
+                                        },
+                                    },
+                                },
+                            },
+                            gtk::Frame {
+                                set_label: Some("Translation HUD preview"),
+                                set_vexpand: true,
+                                gtk::Label {
+                                    set_markup: "<span size='large'>Translations will stream here.</span>",
+                                    set_wrap: true,
+                                    set_margin_all: 12,
+                                },
+                            },
+                            gtk::Label {
+                                set_markup: "<b>Versioned scratchpad</b>",
+                                set_halign: gtk::Align::Start,
+                            },
+                            gtk::Entry {
+                                set_placeholder_text: Some("Model and user notes are committed to the DAG"),
+                                connect_changed[sender] => move |entry| {
+                                    sender.input(AppMsg::ScratchpadInput(entry.text().to_string()));
+                                },
+                            },
+                            gtk::Button {
+                                set_label: "Commit user scratchpad edit",
+                                connect_clicked => AppMsg::CommitScratchpad,
+                            },
                         },
                     },
                 },
-            }
-        }
+            },
+        },
     }
+        }
 
     fn init(
         init: Self::Init,
@@ -721,6 +844,8 @@ impl Component for AppModel {
         let hud = HudWindow::new(&root, &init.capabilities, &init.hud_appearance);
         let hud_positioning = hud.supports_positioning();
         let hud_visible = hud.is_visible();
+        let wine_target_options = gtk::StringList::new(&["Select a Wine/Proton target…"]);
+        let native_application_options = gtk::StringList::new(&["Select a native application…"]);
         let visibility_input = sender.input_sender().clone();
         hud.connect_visible_changed(move |visible| {
             let _ = visibility_input.send(AppMsg::HudVisibilityChanged(visible));
@@ -761,7 +886,8 @@ impl Component for AppModel {
             wine_attach_available,
             wine_artifacts: init.wine_artifacts,
             wine_targets: Vec::new(),
-            wine_target_index: String::new(),
+            wine_target_options,
+            wine_target_selection: None,
             wine_targets_display: if wine_attach_available {
                 "Refresh to discover active Wine/Proton prefixes and Windows processes.".into()
             } else {
@@ -769,8 +895,14 @@ impl Component for AppModel {
             },
             native_text_hook_service: init.native_text_hook_service,
             native_application_id: String::new(),
-            native_hook_status: "Native text hook is connecting to AT-SPI. Enter an application ID to enable capture.".into(),
-            native_applications: String::new(),
+            native_hook_status:
+                "Native text hook is connecting to AT-SPI. Select an application to enable capture."
+                    .into(),
+            native_applications: Vec::new(),
+            native_application_options,
+            native_application_selection: None,
+            native_application_list_status:
+                "Refresh to discover applications exposed through AT-SPI.".into(),
             native_launch_available,
             native_preload_path: init.native_preload_path,
             native_launch_executable: String::new(),
@@ -974,19 +1106,20 @@ impl Component for AppModel {
                     )
                 });
             }
-            AppMsg::WineTargetIndex(value) => self.wine_target_index = value,
+            AppMsg::WineTargetSelected(selected) => {
+                self.wine_target_selection = (selected != gtk::INVALID_LIST_POSITION
+                    && selected > 0)
+                    .then(|| selected.saturating_sub(1) as usize)
+                    .filter(|index| *index < self.wine_targets.len());
+                self.wine_targets_display = self.wine_target_details();
+            }
             AppMsg::AttachWineTarget => {
-                let index = self
-                    .wine_target_index
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| index.checked_sub(1));
-                let Some(target) = index
+                let Some(target) = self
+                    .wine_target_selection
                     .and_then(|index| self.wine_targets.get(index))
                     .cloned()
                 else {
-                    self.wine_hook_status = "Enter a valid Wine target row number.".into();
+                    self.wine_hook_status = "Choose a Wine/Proton target before attaching.".into();
                     return;
                 };
                 self.wine_hook_status = format!(
@@ -1023,13 +1156,22 @@ impl Component for AppModel {
                     "Detached semantic hooks. Injected libraries are inert until process exit."
                         .into();
             }
-            AppMsg::NativeApplicationId(application_id) => {
-                self.native_application_id = application_id;
-                self.native_text_hook_service
-                    .select_application(Some(self.native_application_id.clone()));
+            AppMsg::NativeApplicationSelected(selected) => {
+                self.native_application_selection = (selected != gtk::INVALID_LIST_POSITION
+                    && selected > 0)
+                    .then(|| selected.saturating_sub(1) as usize)
+                    .filter(|index| *index < self.native_applications.len());
+                self.native_application_id = self
+                    .native_application_selection
+                    .and_then(|index| self.native_applications.get(index))
+                    .map(|application| application.id.clone())
+                    .unwrap_or_default();
+                self.native_text_hook_service.select_application(
+                    (!self.native_application_id.trim().is_empty())
+                        .then(|| self.native_application_id.clone()),
+                );
                 self.native_hook_status = if self.native_application_id.trim().is_empty() {
-                    "Native text capture disabled until an AT-SPI application ID is selected."
-                        .into()
+                    "Native text capture is disabled until an application is selected.".into()
                 } else {
                     format!("Native text hook armed for {}.", self.native_application_id)
                 };
@@ -1199,49 +1341,90 @@ impl Component for AppModel {
                 }
             }
             CommandOutput::NativeApplications(Ok(applications)) => {
-                self.native_applications = if applications.is_empty() {
+                let selected_id = self.native_application_id.clone();
+                self.native_applications = applications;
+                let mut labels = vec!["Select a native application…".to_owned()];
+                labels.extend(
+                    self.native_applications
+                        .iter()
+                        .map(native_application_option_label),
+                );
+                let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+                self.native_application_options.splice(
+                    0,
+                    self.native_application_options.n_items(),
+                    &label_refs,
+                );
+                self.native_application_selection = self
+                    .native_applications
+                    .iter()
+                    .position(|application| application.id == selected_id);
+                if self.native_application_selection.is_none() {
+                    self.native_application_id.clear();
+                    self.native_text_hook_service.select_application(None);
+                    self.native_hook_status =
+                        "Native text capture is disabled until an application is selected.".into();
+                }
+                self.native_application_list_status = if self.native_applications.is_empty() {
                     "No native applications are currently exposed through AT-SPI.".into()
                 } else {
-                    applications
-                        .into_iter()
-                        .map(|application| format!("{} — {}", application.name, application.id))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    format!(
+                        "{} native application(s) available. Select one to arm capture.",
+                        self.native_applications.len()
+                    )
                 };
-                self.status =
-                    "Listed native AT-SPI applications. Copy an ID into the native hook field."
-                        .into();
+                self.status = "Native AT-SPI application list refreshed.".into();
             }
             CommandOutput::NativeApplications(Err(error)) => {
-                self.native_applications = format!("Could not list native applications: {error}");
-                self.status = self.native_applications.clone();
+                self.native_applications.clear();
+                self.native_application_selection = None;
+                self.native_application_id.clear();
+                self.native_text_hook_service.select_application(None);
+                self.native_hook_status =
+                    "Native text capture is disabled until an application is selected.".into();
+                self.native_application_options.splice(
+                    0,
+                    self.native_application_options.n_items(),
+                    &["Select a native application…"],
+                );
+                self.native_application_list_status =
+                    format!("Could not list native applications: {error}");
+                self.status = self.native_application_list_status.clone();
             }
             CommandOutput::WineTargets(Ok(targets)) => {
-                self.wine_targets_display = if targets.is_empty() {
+                let selected_key = self
+                    .wine_target_selection
+                    .and_then(|index| self.wine_targets.get(index))
+                    .map(|target| (target.process_id, target.executable.clone()));
+                let mut labels = vec!["Select a Wine/Proton target…".to_owned()];
+                labels.extend(targets.iter().map(wine_target_option_label));
+                let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+                self.wine_target_options
+                    .splice(0, self.wine_target_options.n_items(), &label_refs);
+                self.wine_targets = targets;
+                self.wine_target_selection = selected_key.and_then(|(process_id, executable)| {
+                    self.wine_targets.iter().position(|target| {
+                        target.process_id == process_id && target.executable == executable
+                    })
+                });
+                self.wine_targets_display = if self.wine_targets.is_empty() {
                     "No active Windows processes were found in visible Wine/Proton prefixes.".into()
                 } else {
-                    targets
-                        .iter()
-                        .enumerate()
-                        .map(|(index, target)| {
-                            format!(
-                                "{}. {} — PID {} — {} — {} — {}",
-                                index + 1,
-                                target.executable,
-                                target.process_id,
-                                target.architecture.as_str(),
-                                target.runtime,
-                                target.prefix.display()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    format!(
+                        "{} Wine/Proton target(s) available. Choose one from the dropdown.",
+                        self.wine_targets.len()
+                    )
                 };
-                self.wine_targets = targets;
                 self.wine_hook_status = "Wine target discovery finished.".into();
             }
             CommandOutput::WineTargets(Err(error)) => {
                 self.wine_targets.clear();
+                self.wine_target_selection = None;
+                self.wine_target_options.splice(
+                    0,
+                    self.wine_target_options.n_items(),
+                    &["Select a Wine/Proton target…"],
+                );
                 self.wine_targets_display = format!("Wine discovery unavailable: {error}");
                 self.wine_hook_status = self.wine_targets_display.clone();
             }
@@ -1279,12 +1462,50 @@ impl Component for AppModel {
 }
 
 impl AppModel {
+    fn wine_target_details(&self) -> String {
+        let Some(target) = self
+            .wine_target_selection
+            .and_then(|index| self.wine_targets.get(index))
+        else {
+            return if self.wine_targets.is_empty() {
+                "No Wine/Proton target is selected.".into()
+            } else {
+                "Choose a Wine/Proton target from the dropdown.".into()
+            };
+        };
+        format!(
+            "Selected: {}\nPID: {} · {} · {}\nPrefix: {}",
+            target.executable,
+            target.process_id,
+            target.architecture.as_str(),
+            target.runtime,
+            target.prefix.display()
+        )
+    }
+
+    fn selected_native_application_summary(&self) -> String {
+        let Some(application) = self
+            .native_application_selection
+            .and_then(|index| self.native_applications.get(index))
+        else {
+            return if self.native_applications.is_empty() {
+                "No native application is selected.".into()
+            } else {
+                "Choose a native application from the dropdown.".into()
+            };
+        };
+        format!(
+            "Selected: {}\nAT-SPI application ID: {}",
+            application.name, application.id
+        )
+    }
+
     fn poll_native_text_hook(&mut self, sender: &ComponentSender<Self>) {
         while let Ok(event) = self.native_text_hook_service.try_recv() {
             match event {
                 NativeTextHookEvent::Ready => {
                     self.native_hook_status = if self.native_application_id.trim().is_empty() {
-                        "Native text hook ready. Enter an AT-SPI application ID to enable capture."
+                        "Native text hook ready. Select an AT-SPI application to enable capture."
                             .into()
                     } else {
                         format!("Native text hook armed for {}.", self.native_application_id)
@@ -1857,6 +2078,25 @@ where
     let contents =
         serde_json::to_vec_pretty(value).with_context(|| format!("serialize {description}"))?;
     fs::write(path, contents).with_context(|| format!("write {description} to {}", path.display()))
+}
+
+fn wine_target_option_label(target: &WineTarget) -> String {
+    let executable = Path::new(&target.executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&target.executable);
+    format!(
+        "{executable} — PID {} ({})",
+        target.process_id, target.runtime
+    )
+}
+
+fn native_application_option_label(application: &NativeApplication) -> String {
+    if application.name.trim().is_empty() {
+        application.id.clone()
+    } else {
+        application.name.clone()
+    }
 }
 
 fn start_wine_hook(data_dir: &Path) -> Result<(WineHookService, PathBuf)> {
