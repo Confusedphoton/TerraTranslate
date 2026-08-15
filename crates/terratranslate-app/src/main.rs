@@ -23,7 +23,8 @@ use terratranslate_core::{
     SourceKind, TranslationCommit,
 };
 use terratranslate_engine::{
-    TextInputOptions, TextProcessingSelection, TranslationEngine, TurnInput, TurnRequest,
+    ContextMode, TextInputOptions, TextProcessingSelection, TranslationEngine, TurnInput,
+    TurnRequest,
 };
 use terratranslate_platform_linux::{
     DesktopCapabilities, DisplayServer, NativeApplication, NativeLaunchRequest,
@@ -159,6 +160,8 @@ struct AppModel {
     text_hook_configs_path: PathBuf,
     pending_hook_text: VecDeque<PendingHookText>,
     translation_pending: bool,
+    endless_context_pending: bool,
+    endless_context_include_scratchpad: bool,
     model_settings: ModelSettings,
     model_settings_path: PathBuf,
 }
@@ -187,6 +190,8 @@ enum AppMsg {
     DetachHooks,
     NativeApplicationId(String),
     PollNativeTextHook,
+    EndlessContext(bool),
+    EndlessContextScratchpad(bool),
     RefreshNativeApplications,
     NativeLaunchExecutable(String),
     NativeLaunchArguments(String),
@@ -456,6 +461,40 @@ impl Component for AppModel {
                                     connect_changed[sender] => move |entry| {
                                         sender.input(AppMsg::TargetLanguage(entry.text().to_string()));
                                     },
+                                },
+                            },
+                        },
+                        gtk::Frame {
+                            set_label: Some("Context for next request"),
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 4,
+                                set_margin_all: 8,
+                                gtk::CheckButton {
+                                    set_label: Some("Endless context"),
+                                    #[watch]
+                                    set_active: model.endless_context_pending,
+                                    set_tooltip_text: Some("Send the complete main branch context once, then clear this option"),
+                                    connect_toggled[sender] => move |button| {
+                                        sender.input(AppMsg::EndlessContext(button.is_active()));
+                                    },
+                                },
+                                gtk::CheckButton {
+                                    set_label: Some("Re-insert scratchpad for this request"),
+                                    #[watch]
+                                    set_active: model.endless_context_include_scratchpad,
+                                    #[watch]
+                                    set_sensitive: model.endless_context_pending,
+                                    set_tooltip_text: Some("Include the current scratchpad only in this request; historical scratchpads are never replayed"),
+                                    connect_toggled[sender] => move |button| {
+                                        sender.input(AppMsg::EndlessContextScratchpad(button.is_active()));
+                                    },
+                                },
+                                gtk::Label {
+                                    set_label: "Without the scratchpad option, scratchpad text is omitted and remains empty in the resulting context.",
+                                    set_wrap: true,
+                                    set_halign: gtk::Align::Start,
+                                    add_css_class: "dim-label",
                                 },
                             },
                         },
@@ -747,6 +786,8 @@ impl Component for AppModel {
             text_hook_configs_path: init.text_hook_configs_path,
             pending_hook_text: VecDeque::new(),
             translation_pending: false,
+            endless_context_pending: false,
+            endless_context_include_scratchpad: false,
             model_settings: init.model_settings,
             model_settings_path: init.model_settings_path,
         };
@@ -994,6 +1035,15 @@ impl Component for AppModel {
                 };
             }
             AppMsg::PollNativeTextHook => self.poll_native_text_hook(&sender),
+            AppMsg::EndlessContext(enabled) => {
+                self.endless_context_pending = enabled;
+                if !enabled {
+                    self.endless_context_include_scratchpad = false;
+                }
+            }
+            AppMsg::EndlessContextScratchpad(enabled) => {
+                self.endless_context_include_scratchpad = enabled;
+            }
             AppMsg::RefreshNativeApplications => sender.oneshot_command(async {
                 CommandOutput::NativeApplications(
                     list_native_applications()
@@ -1530,6 +1580,14 @@ impl AppModel {
             .iter()
             .map(|pending| pending.hook_id.clone())
             .collect::<Vec<_>>();
+        let context_mode = if self.endless_context_pending {
+            self.endless_context_pending = false;
+            let include_scratchpad = self.endless_context_include_scratchpad;
+            self.endless_context_include_scratchpad = false;
+            ContextMode::Endless { include_scratchpad }
+        } else {
+            ContextMode::Current
+        };
         self.translation_pending = true;
         self.status = format!("Translating {} selected text hook(s)…", batch.len());
         let data_dir = self.data_dir.clone();
@@ -1539,7 +1597,7 @@ impl AppModel {
             CommandOutput::Translation {
                 hook_ids,
                 result: Box::new(
-                    translate_hook_batch(data_dir, branch, settings, batch)
+                    translate_hook_batch(data_dir, branch, settings, context_mode, batch)
                         .await
                         .map_err(|error| format!("{error:#}")),
                 ),
@@ -1670,6 +1728,7 @@ async fn translate_hook_batch(
     data_dir: PathBuf,
     branch: String,
     settings: ModelSettings,
+    context_mode: ContextMode,
     batch: Vec<PendingHookText>,
 ) -> Result<TranslationCommit> {
     let store = SessionStore::open(data_dir.join("sessions.db"), data_dir.join("blobs"))?;
@@ -1727,6 +1786,7 @@ async fn translate_hook_batch(
             source_language: (!settings.source_language.trim().is_empty())
                 .then(|| settings.source_language.trim().to_owned()),
             target_language: settings.target_language.trim().to_owned(),
+            context_mode,
             inputs,
         })
         .await

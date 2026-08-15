@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use terratranslate_core::{
-    ContextSnapshot, EventId, Modality, ModelMetadata, PayloadRef, ProcessorRequest,
-    ProcessorStage, ProcessorTrace, ScratchpadAuthor, ScratchpadEdit, SourceEvent, SourceKind,
-    TextProcessor, TranslationCommit,
+    ContextHistoryEntry, ContextSnapshot, EventId, Modality, ModelMetadata, PayloadRef,
+    ProcessorRequest, ProcessorStage, ProcessorTrace, ScratchpadAuthor, ScratchpadEdit,
+    SourceEvent, SourceKind, TextProcessor, TranslationCommit,
 };
 use terratranslate_provider::{
     ModelInput, ModelProvider, ProviderError, TranslationRequest, validate_request,
@@ -31,6 +31,17 @@ pub struct TextInputOptions {
     pub processing: TextProcessingSelection,
 }
 
+/// Controls which versioned context is assembled for a translation request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextMode {
+    /// Use the context snapshot at the requested branch's current head.
+    #[default]
+    Current,
+    /// Send the complete `main` branch history and optionally reinsert only the
+    /// requested branch's current scratchpad.
+    Endless { include_scratchpad: bool },
+}
+
 pub struct TurnInput {
     pub captured_at_ms: i64,
     pub source: SourceKind,
@@ -46,6 +57,7 @@ pub struct TurnRequest {
     pub system_prompt: String,
     pub source_language: Option<String>,
     pub target_language: String,
+    pub context_mode: ContextMode,
     pub inputs: Vec<TurnInput>,
 }
 
@@ -101,7 +113,8 @@ impl TranslationEngine {
         }
         let branch = self.store.branch(&turn.branch)?;
         let parent = self.store.get_commit(&branch.head)?;
-        let mut context = parent.context;
+        let (mut context, context_history, retain_scratchpad) =
+            self.prepare_context(parent.context, turn.context_mode)?;
         let mut source_events = Vec::new();
         let mut model_inputs = Vec::new();
         let mut source_text_parts = Vec::new();
@@ -213,6 +226,7 @@ impl TranslationEngine {
             source_language: turn.source_language,
             target_language: turn.target_language,
             context: context.clone(),
+            context_history,
         };
         validate_request(self.provider.capabilities(), &model_request)?;
         let response = self.provider.translate(model_request).await?;
@@ -230,7 +244,14 @@ impl TranslationEngine {
         .await?;
 
         let previous_scratchpad = context.scratchpad.clone();
-        apply_patch(&mut context, response.context_patch);
+        let mut context_patch = response.context_patch;
+        if !retain_scratchpad {
+            context_patch.scratchpad = None;
+        }
+        apply_patch(&mut context, context_patch);
+        if !retain_scratchpad {
+            context.scratchpad.clear();
+        }
         let scratchpad_edits = if context.scratchpad != previous_scratchpad {
             vec![ScratchpadEdit {
                 author: ScratchpadAuthor::Model,
@@ -272,6 +293,44 @@ impl TranslationEngine {
             return Err(EngineError::BranchMoved);
         }
         Ok(commit)
+    }
+
+    fn prepare_context(
+        &self,
+        current_context: ContextSnapshot,
+        mode: ContextMode,
+    ) -> Result<(ContextSnapshot, Vec<ContextHistoryEntry>, bool), EngineError> {
+        match mode {
+            ContextMode::Current => Ok((current_context, vec![], true)),
+            ContextMode::Endless { include_scratchpad } => {
+                let history = self.store.branch_history("main")?;
+                let current_scratchpad = current_context.scratchpad.clone();
+                let mut context = history
+                    .last()
+                    .map(|commit| commit.context.clone())
+                    .unwrap_or(current_context);
+                context.scratchpad = if include_scratchpad {
+                    current_scratchpad
+                } else {
+                    String::new()
+                };
+
+                let context_history = history
+                    .into_iter()
+                    .map(|commit| {
+                        let mut historical_context = commit.context;
+                        historical_context.scratchpad.clear();
+                        ContextHistoryEntry {
+                            source_text: commit.source_text,
+                            translated_text: commit.translated_text,
+                            context: historical_context,
+                        }
+                    })
+                    .collect();
+
+                Ok((context, context_history, include_scratchpad))
+            }
+        }
     }
 
     async fn run_stage(
@@ -400,6 +459,8 @@ fn apply_patch(context: &mut ContextSnapshot, patch: terratranslate_provider::Co
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use async_trait::async_trait;
     use terratranslate_core::{ModelMetadata, NormalizeWhitespace};
     use terratranslate_provider::{ContextPatch, ModelCapabilities, TranslationResponse};
@@ -409,6 +470,10 @@ mod tests {
     struct MockProvider;
 
     struct LabeledProvider;
+
+    struct ContextCaptureProvider {
+        requests: Arc<Mutex<Vec<TranslationRequest>>>,
+    }
 
     #[async_trait]
     impl ModelProvider for MockProvider {
@@ -483,6 +548,42 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for ContextCaptureProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        fn model(&self) -> &str {
+            "mock-context"
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                text: true,
+                tools: true,
+                ..Default::default()
+            }
+        }
+
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+        ) -> Result<TranslationResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(TranslationResponse {
+                translated_text: "translated".into(),
+                context_patch: ContextPatch {
+                    scratchpad: Some("model note".into()),
+                    ..Default::default()
+                },
+                request_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            })
+        }
+    }
+
     fn initialized_store() -> SessionStore {
         let blobs = std::env::temp_dir().join(format!(
             "terratranslate-engine-test-{}",
@@ -507,6 +608,91 @@ mod tests {
         store
     }
 
+    fn text_turn(context_mode: ContextMode) -> TurnRequest {
+        TurnRequest {
+            branch: "main".into(),
+            created_at_ms: 2,
+            system_prompt: "Translate".into(),
+            source_language: None,
+            target_language: "English".into(),
+            context_mode,
+            inputs: vec![TurnInput {
+                captured_at_ms: 2,
+                source: SourceKind::Manual,
+                target: "test".into(),
+                input: ModelInput::Text("current source".into()),
+                text_options: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn endless_context_uses_main_history_and_controls_scratchpad() {
+        let mut store = initialized_store();
+        let main_head = store.branch("main").unwrap().head;
+        let previous = TranslationCommit::create(
+            vec![main_head.clone()],
+            2,
+            vec![],
+            "previous source".into(),
+            "previous translation".into(),
+            ContextSnapshot {
+                summary: "main summary".into(),
+                scratchpad: "current request note".into(),
+                ..Default::default()
+            },
+            vec![],
+            vec![],
+            ModelMetadata::default(),
+            "previous".into(),
+        )
+        .unwrap();
+        store.put_commit(&previous).unwrap();
+        store
+            .advance_branch("main", &main_head, &previous.id, 2)
+            .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ContextCaptureProvider {
+            requests: requests.clone(),
+        });
+        let mut engine = TranslationEngine::new(store, provider);
+
+        let first = engine
+            .translate_turn(text_turn(ContextMode::Endless {
+                include_scratchpad: true,
+            }))
+            .await
+            .unwrap();
+        let first_request = requests.lock().unwrap()[0].clone();
+        assert_eq!(first_request.context.summary, "main summary");
+        assert_eq!(first_request.context.scratchpad, "current request note");
+        assert_eq!(first_request.context_history.len(), 2);
+        assert!(
+            first_request
+                .context_history
+                .iter()
+                .any(|entry| entry.source_text == "previous source")
+        );
+        assert!(
+            first_request
+                .context_history
+                .iter()
+                .all(|entry| entry.context.scratchpad.is_empty())
+        );
+        assert_eq!(first.context.scratchpad, "model note");
+
+        let second = engine
+            .translate_turn(text_turn(ContextMode::Endless {
+                include_scratchpad: false,
+            }))
+            .await
+            .unwrap();
+        let second_request = requests.lock().unwrap()[1].clone();
+        assert!(second_request.context.scratchpad.is_empty());
+        assert!(second.context.scratchpad.is_empty());
+    }
+
     #[tokio::test]
     async fn commits_a_multimodal_turn_and_model_scratchpad() {
         let mut engine = TranslationEngine::new(initialized_store(), Arc::new(MockProvider));
@@ -518,6 +704,7 @@ mod tests {
                 system_prompt: "Translate faithfully".into(),
                 source_language: Some("Japanese".into()),
                 target_language: "English".into(),
+                context_mode: ContextMode::Current,
                 inputs: vec![
                     TurnInput {
                         captured_at_ms: 2,
@@ -568,6 +755,7 @@ mod tests {
                 system_prompt: "Translate".into(),
                 source_language: None,
                 target_language: "English".into(),
+                context_mode: ContextMode::Current,
                 inputs: vec![TurnInput {
                     captured_at_ms: 2,
                     source: SourceKind::WineHook,
@@ -628,6 +816,7 @@ mod tests {
                 system_prompt: "Translate".into(),
                 source_language: None,
                 target_language: "English".into(),
+                context_mode: ContextMode::Current,
                 inputs: vec![
                     input(vec![]),
                     input(vec!["builtin.normalize_whitespace".into()]),

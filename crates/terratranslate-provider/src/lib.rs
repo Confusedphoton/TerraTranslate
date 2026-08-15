@@ -5,7 +5,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use terratranslate_core::ContextSnapshot;
+use terratranslate_core::{ContextHistoryEntry, ContextSnapshot};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -31,6 +31,9 @@ pub struct TranslationRequest {
     pub source_language: Option<String>,
     pub target_language: String,
     pub context: ContextSnapshot,
+    /// Optional oldest-first branch history used by endless-context requests.
+    #[serde(default)]
+    pub context_history: Vec<ContextHistoryEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -139,15 +142,18 @@ impl OpenAiCompatibleProvider {
         }
 
         let context_json = serde_json::to_string(&request.context).expect("context serializes");
+        let history_json =
+            serde_json::to_string(&request.context_history).expect("context history serializes");
         content.insert(
             0,
             json!({
                 "type": "text",
                 "text": format!(
-                    "Translate into {}. Source language: {}. Current versioned context: {}",
+                    "Translate into {}. Source language: {}. Current versioned context: {}. Complete main-branch context history (oldest first): {}",
                     request.target_language,
                     request.source_language.as_deref().unwrap_or("auto-detect"),
-                    context_json
+                    context_json,
+                    history_json
                 )
             }),
         );
@@ -264,6 +270,7 @@ mod tests {
             source_language: None,
             target_language: "English".into(),
             context: ContextSnapshot::default(),
+            context_history: vec![],
         }
     }
 
@@ -285,6 +292,39 @@ mod tests {
             result,
             Err(ProviderError::UnsupportedModality("vision"))
         ));
+    }
+
+    #[test]
+    fn body_includes_complete_context_history() {
+        let provider = OpenAiCompatibleProvider::new(
+            "http://localhost/v1",
+            None,
+            "model",
+            ModelCapabilities {
+                text: true,
+                tools: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut request = request(ModelInput::Text("current".into()));
+        request.context_history = vec![ContextHistoryEntry {
+            source_text: "previous source".into(),
+            translated_text: "previous translation".into(),
+            context: ContextSnapshot {
+                summary: "previous summary".into(),
+                ..Default::default()
+            },
+        }];
+
+        let body = provider.body(&request);
+        let prompt = body["messages"][1]["content"][0]["text"]
+            .as_str()
+            .expect("context prompt is text");
+        assert!(prompt.contains("Complete main-branch context history (oldest first)"));
+        assert!(prompt.contains("previous source"));
+        assert!(prompt.contains("previous translation"));
+        assert!(prompt.contains("previous summary"));
     }
 
     #[test]

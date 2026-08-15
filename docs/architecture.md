@@ -45,6 +45,12 @@ one-sided changes, and reports two-sided conflicts. The user supplies a resolved
 the resulting commit has both heads as parents. Source turns on both sides remain accessible and
 are not flattened into a synthetic chat transcript.
 
+An endless-context request is an explicit one-shot exception at the model-request boundary. The
+engine walks every commit reachable from `main` in oldest-first order and sends the source,
+translation, and context snapshot from each commit alongside the current request. Historical
+scratchpads are removed from that replay. The caller may reinsert the current request's scratchpad;
+otherwise the scratchpad is omitted from both the provider request and the resulting context.
+
 ## Plugin ABI
 
 Plugins export `terratranslate_plugin_v1` and exchange MessagePack domain requests through owned

@@ -102,6 +102,18 @@ pub struct ContextSnapshot {
     pub scratchpad: String,
 }
 
+/// A model-facing entry from a branch's accumulated context history.
+///
+/// The snapshot is retained at every point in the history so an endless-context
+/// request can reconstruct the full evolution of the branch without exposing the
+/// storage commit envelope to a provider.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextHistoryEntry {
+    pub source_text: String,
+    pub translated_text: String,
+    pub context: ContextSnapshot,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScratchpadAuthor {

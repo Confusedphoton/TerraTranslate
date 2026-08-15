@@ -9,7 +9,7 @@ use secrecy::SecretString;
 use terratranslate_core::{
     CommitId, ContextSnapshot, ModelMetadata, NormalizeWhitespace, SourceKind, TranslationCommit,
 };
-use terratranslate_engine::{TranslationEngine, TurnInput, TurnRequest};
+use terratranslate_engine::{ContextMode, TranslationEngine, TurnInput, TurnRequest};
 use terratranslate_platform_linux::list_application_audio_targets;
 use terratranslate_provider::{ModelCapabilities, ModelInput, OpenAiCompatibleProvider};
 use terratranslate_store::SessionStore;
@@ -63,6 +63,12 @@ enum Command {
             default_value = "Translate faithfully while preserving character voice."
         )]
         system_prompt: String,
+        /// Send the complete main-branch context history for this request.
+        #[arg(long)]
+        endless_context: bool,
+        /// Reinsert the current branch scratchpad into this endless-context request.
+        #[arg(long = "endless-context-scratchpad", requires = "endless_context")]
+        endless_context_scratchpad: bool,
     },
     /// Produce the automatic portion and explicit conflicts of a manual merge.
     MergePlan { left: String, right: String },
@@ -114,6 +120,8 @@ async fn main() -> Result<()> {
             image,
             audio,
             system_prompt,
+            endless_context,
+            endless_context_scratchpad,
         } => {
             if text.is_empty() && image.is_empty() && audio.is_empty() {
                 bail!("provide at least one --text, --image, or --audio input");
@@ -181,6 +189,13 @@ async fn main() -> Result<()> {
                     system_prompt,
                     source_language,
                     target_language,
+                    context_mode: if endless_context {
+                        ContextMode::Endless {
+                            include_scratchpad: endless_context_scratchpad,
+                        }
+                    } else {
+                        ContextMode::Current
+                    },
                     inputs,
                 })
                 .await?;

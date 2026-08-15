@@ -1,6 +1,6 @@
 //! SQLite metadata and content-addressed media persistence.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -184,6 +184,36 @@ impl SessionStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Return every commit reachable from a branch head in oldest-first order.
+    ///
+    /// Merge parents are included as well, so the returned history contains the
+    /// complete context graph represented by the branch rather than only its
+    /// first-parent presentation.
+    pub fn branch_history(&self, name: &str) -> Result<Vec<TranslationCommit>, StoreError> {
+        let head = self.branch(name)?.head;
+        let mut seen = HashSet::new();
+        let mut history = Vec::new();
+        let mut stack = vec![(head, false)];
+
+        while let Some((id, expanded)) = stack.pop() {
+            if expanded {
+                history.push(self.get_commit(&id)?);
+                continue;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+
+            let commit = self.get_commit(&id)?;
+            stack.push((id, true));
+            for parent in commit.parents.into_iter().rev() {
+                stack.push((parent, false));
+            }
+        }
+
+        Ok(history)
+    }
+
     pub fn advance_branch(
         &mut self,
         name: &str,
@@ -356,6 +386,43 @@ mod tests {
         assert_eq!(store.merge_base(&left.id, &right.id).unwrap(), root.id);
         let (_, plan) = store.plan_merge(&left.id, &right.id).unwrap();
         assert_eq!(plan.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn branch_history_is_oldest_first_and_includes_merge_parents() {
+        let mut store = SessionStore::in_memory(temp_blob_root()).unwrap();
+        let root = commit(None, 1, "root");
+        let left = commit(Some(root.id.clone()), 2, "left");
+        let right = commit(Some(root.id.clone()), 3, "right");
+        let merge = TranslationCommit::create(
+            vec![left.id.clone(), right.id.clone()],
+            4,
+            vec![],
+            String::new(),
+            String::new(),
+            ContextSnapshot {
+                summary: "merge".into(),
+                ..Default::default()
+            },
+            vec![],
+            vec![],
+            ModelMetadata::default(),
+            "merge".into(),
+        )
+        .unwrap();
+        for value in [&root, &left, &right, &merge] {
+            store.put_commit(value).unwrap();
+        }
+        store.create_branch("main", &merge.id, 4).unwrap();
+
+        let history = store.branch_history("main").unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|value| value.id.clone())
+                .collect::<Vec<_>>(),
+            vec![root.id, left.id, right.id, merge.id]
+        );
     }
 
     #[test]

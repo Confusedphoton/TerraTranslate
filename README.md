@@ -60,6 +60,12 @@ cargo run -p terratranslate-cli -- translate \
 cargo run -p terratranslate-cli -- branches
 cargo run -p terratranslate-cli -- audio-targets
 cargo run -p terratranslate-cli -- merge-plan branch-a branch-b
+
+# Send the full main-branch history for one request and include its current scratchpad.
+cargo run -p terratranslate-cli -- translate \
+  --model your-multimodal-model \
+  --text 'こんにちは' \
+  --endless-context --endless-context-scratchpad
 ```
 
 Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
@@ -73,6 +79,8 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
 - SQLite metadata and content-addressed local frame/audio/text blobs.
 - OpenAI-compatible text, image, audio, and typed context-tool requests with strict capability
   checks.
+- One-shot endless-context requests that replay the complete main-branch context history while
+  optionally reinserting only the current scratchpad.
 - End-to-end turn orchestration that preprocesses inputs, calls a provider, versions model notes,
   stores every modality, and advances the active branch.
 - Ordered built-in processors plus a crash-isolated native plugin ABI and runner.
