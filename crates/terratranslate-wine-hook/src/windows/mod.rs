@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use minhook::MinHook;
@@ -33,9 +33,10 @@ const EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_WIRE_MESSAGE: usize = 1024 * 1024;
 const UNIX_PATH_CAPACITY: usize = 108;
 
-static OBSERVATIONS: OnceLock<SyncSender<Observation>> = OnceLock::new();
+static OBSERVATIONS: OnceLock<Mutex<Option<SyncSender<Observation>>>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
+static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
 static DROPPED_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -59,12 +60,19 @@ pub unsafe extern "system" fn DllMain(
 
 /// Starts IPC and installs hooks on a Rust-owned worker thread.
 ///
-/// Returns immediately. A nonzero result only means the path was accepted and
-/// the worker was created; initialization diagnostics are sent over IPC.
+/// Returns immediately. A nonzero result means the worker was created or was
+/// already running; initialization diagnostics are sent over IPC.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn TerraTranslateHookStartW(config_path: *const u16) -> u32 {
-    if config_path.is_null() || STARTED.swap(true, Ordering::AcqRel) {
+    if config_path.is_null() {
         return 0;
+    }
+    // Loading an already attached DLL is a normal outcome when the user
+    // refreshes the target list, retries an attach, or reconnects after the
+    // host application restarted. Keep the operation idempotent instead of
+    // making the injector report a false failure.
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return 1;
     }
     let Some(path) = (unsafe { copy_nul_terminated(config_path, 32 * 1024) }) else {
         STARTED.store(false, Ordering::Release);
@@ -81,30 +89,20 @@ pub unsafe extern "system" fn TerraTranslateHookStartW(config_path: *const u16) 
 }
 
 fn worker_main(config_path: PathBuf) {
-    let Ok(bytes) = std::fs::read(&config_path) else {
-        STARTED.store(false, Ordering::Release);
+    if read_config(&config_path).is_none() {
+        reset_worker_state();
         return;
-    };
-    let Ok(config) = serde_json::from_slice::<HookBridgeConfig>(&bytes) else {
-        STARTED.store(false, Ordering::Release);
-        return;
-    };
-    let Ok(authentication_token) = config.authentication_token() else {
-        STARTED.store(false, Ordering::Release);
-        return;
-    };
+    }
     let (sender, receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
-    if OBSERVATIONS.set(sender).is_err() {
+    if let Ok(mut observations) = observation_slot().lock() {
+        *observations = Some(sender);
+    } else {
+        reset_worker_state();
         return;
     }
 
-    let hooks = std::panic::catch_unwind(|| unsafe {
-        gdi::install();
-        uniscribe::install();
-        directwrite::install();
-        MinHook::enable_all_hooks()
-    });
-    if !matches!(hooks, Ok(Ok(()))) {
+    if !install_hooks() {
+        reset_worker_state();
         return;
     }
     ACTIVE.store(true, Ordering::Release);
@@ -122,6 +120,10 @@ fn worker_main(config_path: PathBuf) {
     };
     let mut book = CandidateBook::new(executable.clone());
     while ACTIVE.load(Ordering::Acquire) {
+        let Some((config, authentication_token)) = read_config(&config_path) else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
         match UnixSocket::connect(&config.socket_path) {
             Ok(mut stream) => {
                 let hello = BridgeMessage::Hello(BridgeHello {
@@ -153,7 +155,46 @@ fn worker_main(config_path: PathBuf) {
         }
     }
     book.disable_all();
-    let _ = std::panic::catch_unwind(|| unsafe { MinHook::disable_all_hooks() });
+    reset_worker_state();
+}
+
+fn read_config(config_path: &Path) -> Option<(HookBridgeConfig, [u8; 32])> {
+    let bytes = std::fs::read(config_path).ok()?;
+    let config = serde_json::from_slice::<HookBridgeConfig>(&bytes).ok()?;
+    let authentication_token = config.authentication_token().ok()?;
+    Some((config, authentication_token))
+}
+
+fn observation_slot() -> &'static Mutex<Option<SyncSender<Observation>>> {
+    OBSERVATIONS.get_or_init(|| Mutex::new(None))
+}
+
+fn install_hooks() -> bool {
+    let hooks = std::panic::catch_unwind(|| unsafe {
+        if !HOOKS_INSTALLED.load(Ordering::Acquire) {
+            gdi::install();
+            uniscribe::install();
+            directwrite::install();
+        }
+        MinHook::enable_all_hooks()
+    });
+    if matches!(hooks, Ok(Ok(()))) {
+        HOOKS_INSTALLED.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
+fn reset_worker_state() {
+    ACTIVE.store(false, Ordering::Release);
+    if let Ok(mut observations) = observation_slot().lock() {
+        *observations = None;
+    }
+    if HOOKS_INSTALLED.load(Ordering::Acquire) {
+        let _ = std::panic::catch_unwind(|| unsafe { MinHook::disable_all_hooks() });
+    }
+    STARTED.store(false, Ordering::Release);
 }
 
 fn service_connection(
@@ -235,7 +276,11 @@ pub(super) fn observe(adapter: &'static str, api: &'static str, text: String) {
             thread_id: unsafe { GetCurrentThreadId() },
             timestamp_ms: unix_timestamp_ms(),
         };
-        if let Some(sender) = OBSERVATIONS.get() {
+        let sender = observation_slot()
+            .lock()
+            .ok()
+            .and_then(|observations| observations.as_ref().cloned());
+        if let Some(sender) = sender {
             if sender.try_send(observation).is_err() {
                 DROPPED_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
             }
