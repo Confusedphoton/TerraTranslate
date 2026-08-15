@@ -1,6 +1,6 @@
 //! Discovery and attachment planning for Wine/Proton guest processes.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -99,25 +99,27 @@ fn discover_wine_targets_in(proc_root: &Path) -> Result<Vec<WineTarget>, WineTar
             continue;
         };
         let directory = entry.path();
-        let environment = match fs::read(directory.join("environ")) {
-            Ok(bytes) => parse_nul_pairs(&bytes),
-            Err(_) => continue,
-        };
-        let prefix = environment
-            .iter()
-            .find(|(key, _)| key == "WINEPREFIX")
-            .map(|(_, value)| PathBuf::from(value))
-            .or_else(|| {
-                environment
-                    .iter()
-                    .find(|(key, _)| key == "STEAM_COMPAT_DATA_PATH")
-                    .map(|(_, value)| PathBuf::from(value).join("pfx"))
-            });
+        // Wine consumes WINEPREFIX and Proton's Steam variables before it
+        // creates the guest process, so they are often absent from the
+        // process environment exposed by /proc. Keep mapping discovery
+        // independent from that optional metadata.
+        let environment = fs::read(directory.join("environ"))
+            .map(|bytes| parse_nul_pairs(&bytes))
+            .unwrap_or_default();
+        let command_line = fs::read(directory.join("cmdline")).unwrap_or_default();
+        let arguments = parse_nul_values(&command_line);
+        let mapped_paths_on_process = fs::read_to_string(directory.join("maps"))
+            .ok()
+            .map(|maps| mapped_paths(&maps).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let prefix = prefix_from_environment(&environment).or_else(|| {
+            mapped_paths_on_process
+                .iter()
+                .find_map(|path| prefix_from_mapped_path(path))
+        });
         let Some(prefix) = prefix else {
             continue;
         };
-        let command_line = fs::read(directory.join("cmdline")).unwrap_or_default();
-        let arguments = parse_nul_values(&command_line);
         let runtime_command = environment
             .iter()
             .find(|(key, _)| key == "WINELOADER")
@@ -130,14 +132,11 @@ fn discover_wine_targets_in(proc_root: &Path) -> Result<Vec<WineTarget>, WineTar
                         .then(|| PathBuf::from(argument))
                 })
             })
+            .or_else(|| process_runtime_command(&directory))
             .unwrap_or_else(|| PathBuf::from("wine"));
-        let mapped_images = fs::read_to_string(directory.join("maps"))
-            .ok()
-            .into_iter()
-            .flat_map(|maps| mapped_executables(&maps).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let Some((executable, architecture)) = mapped_images
+        let Some((executable, architecture)) = mapped_paths_on_process
             .iter()
+            .filter(|path| is_pe_executable(path) && !is_wine_infrastructure_executable(path))
             .find_map(|path| pe_architecture(path).map(|architecture| (path.clone(), architecture)))
             .or_else(|| {
                 arguments.iter().find_map(|argument| {
@@ -148,19 +147,21 @@ fn discover_wine_targets_in(proc_root: &Path) -> Result<Vec<WineTarget>, WineTar
         else {
             continue;
         };
+        let runtime = if environment
+            .iter()
+            .any(|(key, value)| key == "STEAM_COMPAT_DATA_PATH" && !value.is_empty())
+            || is_proton_prefix(&prefix)
+        {
+            "proton"
+        } else {
+            "wine"
+        };
         targets.push(WineTarget {
             process_id,
             executable: executable.to_string_lossy().into_owned(),
             architecture,
             prefix,
-            runtime: if environment
-                .iter()
-                .any(|(key, _)| key == "STEAM_COMPAT_DATA_PATH")
-            {
-                "proton".into()
-            } else {
-                "wine".into()
-            },
+            runtime: runtime.into(),
             runtime_command,
         });
     }
@@ -207,6 +208,44 @@ pub fn attach_wine_target(
     Ok(())
 }
 
+fn prefix_from_environment(environment: &[(String, String)]) -> Option<PathBuf> {
+    environment
+        .iter()
+        .find(|(key, value)| key == "WINEPREFIX" && !value.is_empty())
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| {
+            environment
+                .iter()
+                .find(|(key, value)| key == "STEAM_COMPAT_DATA_PATH" && !value.is_empty())
+                .map(|(_, value)| PathBuf::from(value).join("pfx"))
+        })
+}
+
+fn prefix_from_mapped_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("drive_c")))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+fn is_proton_prefix(prefix: &Path) -> bool {
+    prefix.file_name() == Some(OsStr::new("pfx"))
+        && prefix
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("compatdata"))
+}
+
+fn process_runtime_command(directory: &Path) -> Option<PathBuf> {
+    let executable = fs::read_link(directory.join("exe")).ok()?;
+    let name = executable
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let preloader_name = name.strip_suffix("-preloader")?;
+    let loader = executable.with_file_name(preloader_name);
+    loader.is_file().then_some(loader)
+}
+
 fn parse_nul_pairs(bytes: &[u8]) -> Vec<(String, String)> {
     parse_nul_values(bytes)
         .into_iter()
@@ -225,13 +264,60 @@ fn parse_nul_values(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn mapped_executables(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {
+fn mapped_paths(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {
     maps.lines().filter_map(|line| {
-        let path = line.split_whitespace().nth(5)?;
-        path.to_ascii_lowercase()
-            .ends_with(".exe")
-            .then(|| PathBuf::from(path))
+        let path = mapped_path(line)?;
+        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+        Some(PathBuf::from(path))
     })
+}
+
+fn mapped_path(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    for _ in 0..5 {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return None;
+        }
+        while bytes
+            .get(index)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+    }
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    (index < bytes.len()).then(|| &line[index..])
+}
+
+fn is_pe_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
+fn is_wine_infrastructure_executable(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            [
+                "winedevice.exe",
+                "wineboot.exe",
+                "winemenubuilder.exe",
+                "services.exe",
+                "plugplay.exe",
+                "rpcss.exe",
+                "svchost.exe",
+                "explorer.exe",
+            ]
+            .iter()
+            .any(|infrastructure| name.eq_ignore_ascii_case(infrastructure))
+        })
 }
 
 fn pe_architecture(path: &Path) -> Option<WineProcessArchitecture> {
@@ -289,6 +375,76 @@ mod tests {
         assert_eq!(targets[0].prefix, Path::new("/games/prefix"));
         assert_eq!(targets[0].runtime_command, Path::new("wine64"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovers_guest_when_wine_metadata_is_not_inherited() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tt-wine-target-no-env-{nonce}"));
+        let process = root.join("314");
+        let prefix = root.join("steam/steamapps/compatdata/123/pfx");
+        let prefix_image = prefix.join("drive_c/windows/system32/user32.dll");
+        let image = root.join("Games/Pokemon Academy Life Forever/game.exe");
+        fs::create_dir_all(&process).unwrap();
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::create_dir_all(prefix_image.parent().unwrap()).unwrap();
+
+        let mut pe = vec![0; 0x86];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x014c_u16.to_le_bytes());
+        fs::write(&image, pe).unwrap();
+        fs::write(process.join("environ"), b"HOME=/home/test\0").unwrap();
+        fs::write(
+            process.join("cmdline"),
+            b"Z:\\Games\\Pokemon Academy Life Forever\\game.exe\0",
+        )
+        .unwrap();
+        fs::write(
+            process.join("maps"),
+            format!(
+                "00400000-00500000 r-xp 0 00:00 0 {}\n7b000000-7b001000 r--p 0 00:00 0 {}\n",
+                image.display(),
+                prefix_image.display()
+            ),
+        )
+        .unwrap();
+
+        let targets = discover_wine_targets_in(&root).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].process_id, 314);
+        assert_eq!(targets[0].executable, image.to_string_lossy());
+        assert_eq!(targets[0].architecture, WineProcessArchitecture::X86);
+        assert_eq!(targets[0].prefix, prefix);
+        assert_eq!(targets[0].runtime, "proton");
+        assert_eq!(targets[0].runtime_command, Path::new("wine"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_mapped_paths_with_spaces_and_deleted_suffixes() {
+        let paths = mapped_paths(
+            "00400000-00500000 r-xp 0 00:00 0 /games/Pokemon Academy Life Forever.exe (deleted)\n",
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/games/Pokemon Academy Life Forever.exe")]
+        );
+    }
+
+    #[test]
+    fn ignores_wine_infrastructure_process_images() {
+        assert!(is_wine_infrastructure_executable(Path::new(
+            "/usr/lib/wine/x86_64-windows/winedevice.exe"
+        )));
+        assert!(!is_wine_infrastructure_executable(Path::new(
+            "/games/Pokemon Academy Life Forever/game.exe"
+        )));
     }
 
     #[test]

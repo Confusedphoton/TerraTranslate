@@ -20,32 +20,63 @@ pub struct NativeApplication {
     pub name: String,
 }
 
+const ATSPI_REGISTRY_SERVICE: &str = "org.a11y.atspi.Registry";
+const ATSPI_ACCESSIBLE_ROOT: &str = "/org/a11y/atspi/accessible/root";
+
+fn is_atspi_service_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("org.freedesktop.dbus.error.serviceunknown") || error.contains("not activatable")
+}
+
 /// List applications currently exposed by the user's AT-SPI accessibility bus.
 pub async fn list_native_applications() -> Result<Vec<NativeApplication>, NativeAccessibilityError>
 {
-    let connection = AccessibilityConnection::new()
+    let connection = match AccessibilityConnection::new().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            let error = error.to_string();
+            if is_atspi_service_unavailable(&error) {
+                return Ok(Vec::new());
+            }
+            return Err(NativeAccessibilityError(error));
+        }
+    };
+    let root = match atspi::proxy::accessible::AccessibleProxy::builder(connection.connection())
+        .destination(ATSPI_REGISTRY_SERVICE)
+        .map_err(|error| NativeAccessibilityError(error.to_string()))?
+        .path(ATSPI_ACCESSIBLE_ROOT)
+        .map_err(|error| NativeAccessibilityError(error.to_string()))?
+        .build()
         .await
-        .map_err(|error| NativeAccessibilityError(error.to_string()))?;
-    let root = atspi::proxy::accessible::AccessibleProxy::new(connection.connection())
-        .await
-        .map_err(|error| NativeAccessibilityError(error.to_string()))?;
-    let children = root
-        .get_children()
-        .await
-        .map_err(|error| NativeAccessibilityError(error.to_string()))?;
+    {
+        Ok(root) => root,
+        Err(error) if is_atspi_service_unavailable(&error.to_string()) => return Ok(Vec::new()),
+        Err(error) => return Err(NativeAccessibilityError(error.to_string())),
+    };
+    let children = match root.get_children().await {
+        Ok(children) => children,
+        Err(error) if is_atspi_service_unavailable(&error.to_string()) => return Ok(Vec::new()),
+        Err(error) => return Err(NativeAccessibilityError(error.to_string())),
+    };
     let mut applications = Vec::new();
     for child in children {
         let Some(id) = child.name_as_str() else {
             continue;
         };
-        let proxy = atspi::proxy::accessible::AccessibleProxy::builder(connection.connection())
-            .destination(id)
-            .map_err(|error| NativeAccessibilityError(error.to_string()))?
-            .path(child.path_as_str())
-            .map_err(|error| NativeAccessibilityError(error.to_string()))?
-            .build()
-            .await
-            .map_err(|error| NativeAccessibilityError(error.to_string()))?;
+        let proxy =
+            match atspi::proxy::accessible::AccessibleProxy::builder(connection.connection())
+                .destination(id)
+                .map_err(|error| NativeAccessibilityError(error.to_string()))?
+                .path(child.path_as_str())
+                .map_err(|error| NativeAccessibilityError(error.to_string()))?
+                .build()
+                .await
+            {
+                Ok(proxy) => proxy,
+                // Applications can disappear between GetChildren and proxy creation.
+                Err(error) if is_atspi_service_unavailable(&error.to_string()) => continue,
+                Err(error) => return Err(NativeAccessibilityError(error.to_string())),
+            };
         let name = proxy.name().await.unwrap_or_else(|_| id.to_owned());
         applications.push(NativeApplication {
             id: id.to_owned(),
@@ -175,4 +206,27 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_atspi_service_unavailable;
+
+    #[test]
+    fn recognizes_missing_or_unactivatable_atspi_service() {
+        assert!(is_atspi_service_unavailable(
+            "org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable"
+        ));
+        assert!(is_atspi_service_unavailable(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(is_atspi_service_unavailable("The name is not activatable"));
+    }
+
+    #[test]
+    fn preserves_unrelated_atspi_errors() {
+        assert!(!is_atspi_service_unavailable(
+            "org.freedesktop.DBus.Error.AccessDenied: denied"
+        ));
+    }
 }
