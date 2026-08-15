@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use minhook::MinHook;
-use windows_sys::Win32::Foundation::{BOOL, RECT};
+use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Globalization::{
     CHARSETINFO, FONTSIGNATURE, GetACP, GetTextCharsetInfo, MultiByteToWideChar, TCI_SRCCHARSET,
     TranslateCharsetInfo,
@@ -10,6 +10,7 @@ use windows_sys::Win32::Globalization::{
 use windows_sys::Win32::Graphics::Gdi::{
     DRAWTEXTPARAMS, ETO_GLYPH_INDEX, HDC, POLYTEXTA, POLYTEXTW,
 };
+use windows_sys::core::BOOL;
 
 use crate::{MAX_TEXT_UTF16, bounded_utf16};
 

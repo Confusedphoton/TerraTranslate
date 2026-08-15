@@ -40,17 +40,43 @@ pub struct WineArtifacts {
 
 impl WineArtifacts {
     pub fn host_defaults() -> Self {
-        let lib = std::env::var_os("TERRATRANSLATE_WINE_LIB_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/usr/lib/terratranslate/wine"));
-        let libexec = std::env::var_os("TERRATRANSLATE_WINE_LIBEXEC_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/usr/libexec/terratranslate/wine"));
+        let lib_override = std::env::var_os("TERRATRANSLATE_WINE_LIB_DIR").map(PathBuf::from);
+        let libexec_override =
+            std::env::var_os("TERRATRANSLATE_WINE_LIBEXEC_DIR").map(PathBuf::from);
+        let candidates = default_artifact_candidates();
         Self {
-            injector_x86: libexec.join("i686/terratranslate-wine-injector.exe"),
-            injector_x86_64: libexec.join("x86_64/terratranslate-wine-injector.exe"),
-            hook_x86: lib.join("i686/terratranslate_wine_hook.dll"),
-            hook_x86_64: lib.join("x86_64/terratranslate_wine_hook.dll"),
+            injector_x86: resolve_artifact(
+                libexec_override
+                    .as_deref()
+                    .map(|root| root.join("i686/terratranslate-wine-injector.exe")),
+                candidates
+                    .iter()
+                    .map(|artifacts| artifacts.injector_x86.clone()),
+            ),
+            injector_x86_64: resolve_artifact(
+                libexec_override
+                    .as_deref()
+                    .map(|root| root.join("x86_64/terratranslate-wine-injector.exe")),
+                candidates
+                    .iter()
+                    .map(|artifacts| artifacts.injector_x86_64.clone()),
+            ),
+            hook_x86: resolve_artifact(
+                lib_override
+                    .as_deref()
+                    .map(|root| root.join("i686/terratranslate_wine_hook.dll")),
+                candidates
+                    .iter()
+                    .map(|artifacts| artifacts.hook_x86.clone()),
+            ),
+            hook_x86_64: resolve_artifact(
+                lib_override
+                    .as_deref()
+                    .map(|root| root.join("x86_64/terratranslate_wine_hook.dll")),
+                candidates
+                    .iter()
+                    .map(|artifacts| artifacts.hook_x86_64.clone()),
+            ),
         }
     }
 
@@ -62,6 +88,84 @@ impl WineArtifacts {
     }
 }
 
+fn default_artifact_candidates() -> Vec<WineArtifacts> {
+    let mut candidates = Vec::new();
+    if let Some((target_dir, profile)) = development_target_location() {
+        let profiles = if profile == "debug" {
+            ["debug", "release"]
+        } else {
+            ["release", "debug"]
+        };
+        candidates.extend(
+            profiles
+                .into_iter()
+                .map(|profile| development_artifacts(&target_dir, profile)),
+        );
+    }
+    if let Some(prefix) = executable_prefix() {
+        candidates.push(installed_artifacts(&prefix));
+    }
+    candidates.push(installed_artifacts(Path::new("/usr")));
+    candidates
+}
+
+fn resolve_artifact(
+    explicit_path: Option<PathBuf>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> PathBuf {
+    if let Some(path) = explicit_path {
+        return path;
+    }
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+        .expect("Wine artifact candidate list cannot be empty")
+}
+
+fn development_target_location() -> Option<(PathBuf, String)> {
+    let executable = std::env::current_exe().ok()?;
+    let profile_dir = executable.parent()?;
+    let profile = profile_dir.file_name()?.to_str()?;
+    if !matches!(profile, "debug" | "release") {
+        return None;
+    }
+    Some((profile_dir.parent()?.to_path_buf(), profile.to_owned()))
+}
+
+fn development_artifacts(target_dir: &Path, profile: &str) -> WineArtifacts {
+    let target_artifacts = |target: &str| target_dir.join(target).join(profile);
+    WineArtifacts {
+        injector_x86: target_artifacts("i686-pc-windows-gnu")
+            .join("terratranslate-wine-injector.exe"),
+        injector_x86_64: target_artifacts("x86_64-pc-windows-gnu")
+            .join("terratranslate-wine-injector.exe"),
+        hook_x86: target_artifacts("i686-pc-windows-gnu").join("terratranslate_wine_hook.dll"),
+        hook_x86_64: target_artifacts("x86_64-pc-windows-gnu").join("terratranslate_wine_hook.dll"),
+    }
+}
+
+fn executable_prefix() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let bin_dir = executable.parent()?;
+    (bin_dir.file_name() == Some(OsStr::new("bin")))
+        .then(|| bin_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn installed_artifacts(prefix: &Path) -> WineArtifacts {
+    let lib = prefix.join("lib/terratranslate/wine");
+    let libexec = prefix.join("libexec/terratranslate/wine");
+    WineArtifacts {
+        injector_x86: libexec.join("i686/terratranslate-wine-injector.exe"),
+        injector_x86_64: libexec.join("x86_64/terratranslate-wine-injector.exe"),
+        hook_x86: lib.join("i686/terratranslate_wine_hook.dll"),
+        hook_x86_64: lib.join("x86_64/terratranslate_wine_hook.dll"),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WineTargetError {
     #[error("Wine process discovery is unavailable in Flatpak; install and run the host build")]
@@ -70,8 +174,11 @@ pub enum WineTargetError {
     Io(#[from] std::io::Error),
     #[error("{kind} artifact is missing: {path}")]
     MissingArtifact { kind: &'static str, path: PathBuf },
-    #[error("Wine injector failed with {status}")]
-    Injector { status: ExitStatus },
+    #[error("Wine injector failed with {status}: {diagnostic}")]
+    Injector {
+        status: ExitStatus,
+        diagnostic: String,
+    },
 }
 
 /// Finds Wine/Proton processes visible through `/proc`. Each result has a
@@ -171,7 +278,10 @@ fn discover_wine_targets_in(proc_root: &Path) -> Result<Vec<WineTarget>, WineTar
 
 /// Runs the architecture-matched injector inside the selected prefix. Paths
 /// are passed as separate arguments and Wine converts host absolute paths
-/// through its `Z:` mapping; no shell is involved.
+/// through its `Z:` mapping; no shell is involved. The target's Linux PID is
+/// deliberately not passed to the injector: Wine exposes a different,
+/// Windows-side PID to Windows APIs. The injector resolves the target by its
+/// executable path inside the prefix instead.
 pub fn attach_wine_target(
     target: &WineTarget,
     artifacts: &WineArtifacts,
@@ -192,18 +302,32 @@ pub fn attach_wine_target(
     }
     let wine = std::env::var_os("TERRATRANSLATE_WINE_COMMAND")
         .unwrap_or_else(|| OsString::from(&target.runtime_command));
-    let status = Command::new(wine)
+    let output = Command::new(wine)
         .env("WINEPREFIX", &target.prefix)
         .arg(injector)
-        .arg("--process-id")
-        .arg(target.process_id.to_string())
+        .arg("--executable")
+        .arg(&target.executable)
         .arg("--dll")
         .arg(hook)
         .arg("--config")
         .arg(config)
-        .status()?;
-    if !status.success() {
-        return Err(WineTargetError::Injector { status });
+        .output()?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let diagnostic = if diagnostic.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        } else {
+            diagnostic
+        };
+        let diagnostic = if diagnostic.is_empty() {
+            "no diagnostic output".to_owned()
+        } else {
+            diagnostic
+        };
+        return Err(WineTargetError::Injector {
+            status: output.status,
+            diagnostic,
+        });
     }
     Ok(())
 }
@@ -450,5 +574,39 @@ mod tests {
     #[test]
     fn requires_a_real_pe_image() {
         assert_eq!(pe_architecture(Path::new("/does/not/exist")), None);
+    }
+
+    #[test]
+    fn development_artifacts_follow_cargo_target_layout() {
+        let artifacts = development_artifacts(Path::new("/build/terratranslate/target"), "debug");
+        assert_eq!(
+            artifacts.injector_x86_64,
+            Path::new(
+                "/build/terratranslate/target/x86_64-pc-windows-gnu/debug/terratranslate-wine-injector.exe"
+            )
+        );
+        assert_eq!(
+            artifacts.hook_x86,
+            Path::new(
+                "/build/terratranslate/target/i686-pc-windows-gnu/debug/terratranslate_wine_hook.dll"
+            )
+        );
+    }
+
+    #[test]
+    fn installed_artifacts_follow_prefix_layout() {
+        let artifacts = installed_artifacts(Path::new("/opt/terratranslate"));
+        assert_eq!(
+            artifacts.injector_x86,
+            Path::new(
+                "/opt/terratranslate/libexec/terratranslate/wine/i686/terratranslate-wine-injector.exe"
+            )
+        );
+        assert_eq!(
+            artifacts.hook_x86_64,
+            Path::new(
+                "/opt/terratranslate/lib/terratranslate/wine/x86_64/terratranslate_wine_hook.dll"
+            )
+        );
     }
 }

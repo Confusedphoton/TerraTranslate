@@ -8,8 +8,12 @@ struct Arguments {
     /// List processes visible in the current Wine prefix as JSON lines.
     #[arg(long)]
     list: bool,
-    #[arg(long, required_unless_present = "list")]
+    /// Windows-side process ID. This is not the Linux host PID of a Wine process.
+    #[arg(long)]
     process_id: Option<u32>,
+    /// Executable path used to resolve the Windows-side process ID inside Wine.
+    #[arg(long)]
+    executable: Option<PathBuf>,
     #[arg(long, required_unless_present = "list")]
     dll: Option<PathBuf>,
     /// Guest-visible path to the authenticated bridge configuration.
@@ -34,12 +38,18 @@ fn main() {
     let result = if arguments.list {
         windows_impl::list_processes()
     } else {
-        windows_impl::inject(
-            arguments.process_id.expect("clap requires process id"),
-            arguments.dll.as_deref().expect("clap requires DLL"),
-            arguments.config.as_deref().expect("clap requires config"),
-            arguments.timeout_ms,
-        )
+        let dll = arguments.dll.as_deref().expect("clap requires DLL");
+        let config = arguments.config.as_deref().expect("clap requires config");
+        match (arguments.process_id, arguments.executable.as_deref()) {
+            (Some(process_id), None) => {
+                windows_impl::inject(process_id, dll, config, arguments.timeout_ms)
+            }
+            (None, Some(executable)) => {
+                windows_impl::inject_by_executable(executable, dll, config, arguments.timeout_ms)
+            }
+            (Some(_), Some(_)) => Err("pass either --process-id or --executable, not both".into()),
+            (None, None) => Err("one of --process-id or --executable is required".into()),
+        }
     };
     if let Err(error) = result {
         eprintln!("wine hook operation failed: {error}");
@@ -57,7 +67,9 @@ mod windows_impl {
 
     use serde_json::json;
     use terratranslate_wine_injector::{PeArchitecture, read_pe_architecture};
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FreeLibrary, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
@@ -65,7 +77,7 @@ mod windows_impl {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::LibraryLoader::{
-        DONT_RESOLVE_DLL_REFERENCES, FreeLibrary, GetModuleHandleW, GetProcAddress, LoadLibraryExW,
+        DONT_RESOLVE_DLL_REFERENCES, GetModuleHandleW, GetProcAddress, LoadLibraryExW,
     };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
@@ -166,6 +178,16 @@ mod windows_impl {
         Ok(())
     }
 
+    pub fn inject_by_executable(
+        executable: &Path,
+        dll: &Path,
+        config: &Path,
+        timeout_ms: u32,
+    ) -> Result<(), String> {
+        let process_id = find_process_id(executable)?;
+        inject(process_id, dll, config, timeout_ms)
+    }
+
     pub fn list_processes() -> Result<(), String> {
         unsafe {
             let snapshot = OwnedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0))
@@ -209,6 +231,66 @@ mod windows_impl {
             }
         }
         Ok(())
+    }
+
+    fn find_process_id(executable: &Path) -> Result<u32, String> {
+        let expected = normalize_process_path(executable);
+        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| last_error("CreateToolhelp32Snapshot(processes)"))?;
+        let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+            return Err(last_error("Process32FirstW"));
+        }
+
+        let mut matches = Vec::new();
+        loop {
+            if let Some(process) = OwnedHandle::new(unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID)
+            }) {
+                if let Ok(path) = unsafe { query_process_image_name(process.0) } {
+                    if normalize_process_path(Path::new(&path)) == expected {
+                        matches.push(entry.th32ProcessID);
+                    }
+                }
+            }
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                break;
+            }
+        }
+
+        match matches.as_slice() {
+            [process_id] => Ok(*process_id),
+            [] => Err(format!(
+                "could not find a Windows process for executable {}",
+                executable.display()
+            )),
+            process_ids => Err(format!(
+                "multiple Windows processes match executable {}: {process_ids:?}",
+                executable.display()
+            )),
+        }
+    }
+
+    unsafe fn query_process_image_name(process: HANDLE) -> Result<String, String> {
+        let mut path = vec![0_u16; 32 * 1024];
+        let mut length = path.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } == 0 {
+            return Err(last_error("QueryFullProcessImageNameW"));
+        }
+        path.truncate(length as usize);
+        Ok(String::from_utf16_lossy(&path))
+    }
+
+    fn normalize_process_path(path: &Path) -> String {
+        let value = path.to_string_lossy().replace('/', "\\");
+        let value = value.strip_prefix("\\\\?\\").unwrap_or(&value);
+        let value = if value.starts_with('\\') && !value.starts_with("\\\\") {
+            format!("z:{value}")
+        } else {
+            value.to_owned()
+        };
+        value.trim_end_matches('\\').to_ascii_lowercase()
     }
 
     unsafe fn process_machine(process: HANDLE) -> Result<IMAGE_FILE_MACHINE, String> {

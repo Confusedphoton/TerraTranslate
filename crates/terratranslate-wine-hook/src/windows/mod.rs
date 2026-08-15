@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use minhook::MinHook;
@@ -12,7 +12,7 @@ use terratranslate_wine_protocol::{
     HostMessage, MAX_IDENTITY_BYTES, PROTOCOL_VERSION, ProcessArchitecture, decode, encode,
 };
 use uuid::Uuid;
-use windows_sys::Win32::Foundation::{BOOL, FILETIME, HINSTANCE, TRUE};
+use windows_sys::Win32::Foundation::{FILETIME, HINSTANCE, TRUE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKET, WSADATA, WSAEWOULDBLOCK,
     WSAGetLastError, WSAStartup, closesocket, connect, ioctlsocket, recv, send, socket,
@@ -20,6 +20,7 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModuleFileNameW};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows_sys::core::BOOL;
 
 use crate::{CandidateBook, Observation, bounded_utf8};
 

@@ -20,6 +20,20 @@ cargo test --workspace
 cargo run -p terratranslate-app --bin terratranslate
 ```
 
+Wine/Proton attachment additionally needs the matching Windows artifacts. Install the MinGW Rust
+targets and build both architectures; when the app is run from this checkout it automatically
+checks the corresponding `target/<triple>/<profile>` directories before packaged locations:
+
+```sh
+rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
+cargo build --target i686-pc-windows-gnu -p terratranslate-wine-hook -p terratranslate-wine-injector
+cargo build --target x86_64-pc-windows-gnu -p terratranslate-wine-hook -p terratranslate-wine-injector
+```
+
+The host package installs these files with `packaging/install-host-artifacts.sh`. Custom artifact
+locations can be selected with `TERRATRANSLATE_WINE_LIB_DIR` and
+`TERRATRANSLATE_WINE_LIBEXEC_DIR`.
+
 Print the capability report without opening a window:
 
 ```sh
