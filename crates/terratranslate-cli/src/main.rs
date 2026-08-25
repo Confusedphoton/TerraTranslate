@@ -7,12 +7,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use secrecy::SecretString;
 use terratranslate_core::{
-    CommitId, ContextSnapshot, ModelMetadata, NormalizeWhitespace, SourceKind, TranslationCommit,
+    CommitId, ContextSnapshot, GameIdentity, ModelMetadata, NormalizeWhitespace, SourceKind,
+    TranslationCommit,
 };
 use terratranslate_engine::{ContextMode, TranslationEngine, TurnInput, TurnRequest};
 use terratranslate_platform_linux::list_application_audio_targets;
 use terratranslate_provider::{ModelCapabilities, ModelInput, OpenAiCompatibleProvider};
-use terratranslate_store::SessionStore;
+use terratranslate_store::{SessionStore, StoreError};
 
 #[derive(Parser)]
 #[command(
@@ -31,7 +32,13 @@ enum Command {
     /// Initialize an empty session database and main branch.
     Init,
     /// List branch heads.
-    Branches,
+    Branches {
+        /// Stable identity key used when listing one game's history.
+        #[arg(long)]
+        game: Option<String>,
+    },
+    /// List registered game identities.
+    Games,
     /// List live application playback nodes available for target-audio capture.
     AudioTargets,
     /// Create or reset a branch from another branch or full commit ID.
@@ -39,6 +46,8 @@ enum Command {
         name: String,
         #[arg(long, default_value = "main")]
         from: String,
+        #[arg(long)]
+        game: Option<String>,
     },
     /// Submit a versioned text/image/audio translation turn.
     Translate {
@@ -52,6 +61,11 @@ enum Command {
         target_language: String,
         #[arg(long)]
         source_language: Option<String>,
+        /// Stable identity key used to select an independent per-game history.
+        #[arg(long)]
+        game: Option<String>,
+        #[arg(long, default_value = "CLI game")]
+        game_name: String,
         #[arg(long)]
         text: Vec<String>,
         #[arg(long)]
@@ -63,6 +77,11 @@ enum Command {
             default_value = "Translate faithfully while preserving character voice."
         )]
         system_prompt: String,
+        #[arg(
+            long,
+            default_value = "Translate every text input into {{target_language}} in order.\n\n{{texts|enumerate}}"
+        )]
+        user_prompt: String,
         /// Send the complete main-branch context history for this request.
         #[arg(long)]
         endless_context: bool,
@@ -71,7 +90,12 @@ enum Command {
         endless_context_scratchpad: bool,
     },
     /// Produce the automatic portion and explicit conflicts of a manual merge.
-    MergePlan { left: String, right: String },
+    MergePlan {
+        left: String,
+        right: String,
+        #[arg(long)]
+        game: Option<String>,
+    },
     /// Create a two-parent merge using a manually resolved ContextSnapshot JSON file.
     Merge {
         left: String,
@@ -82,6 +106,8 @@ enum Command {
         target_branch: String,
         #[arg(long, default_value = "Merge translation context")]
         message: String,
+        #[arg(long)]
+        game: Option<String>,
     },
 }
 
@@ -99,15 +125,34 @@ async fn main() -> Result<()> {
     let mut store = open_store(&data_dir)?;
     match arguments.command {
         Command::Init => println!("Initialized {}", data_dir.display()),
-        Command::Branches => {
-            for branch in store.list_branches()? {
+        Command::Branches { game } => {
+            let branches = match game.as_deref() {
+                Some(game) => {
+                    let identity = ensure_cli_game(&mut store, game)?;
+                    store.list_game_branches(&identity.id)?
+                }
+                None => store.list_branches()?,
+            };
+            for branch in branches {
                 println!("{}\t{}", branch.name, branch.head);
             }
         }
+        Command::Games => {
+            for game in store.list_games()? {
+                println!("{}\t{}\t{}", game.id, game.name, game.executable_path);
+            }
+        }
         Command::AudioTargets => unreachable!("handled before opening the session store"),
-        Command::Branch { name, from } => {
-            let head = resolve_ref(&store, &from)?;
-            let branch = store.create_branch(&name, &head, now_ms())?;
+        Command::Branch { name, from, game } => {
+            let game_identity = game
+                .as_deref()
+                .map(|game| ensure_cli_game(&mut store, game))
+                .transpose()?;
+            let head = resolve_ref_for_game(&store, game.as_deref(), &from)?;
+            let branch = match game_identity.as_ref() {
+                Some(game) => store.create_game_branch(&game.id, &name, &head, now_ms())?,
+                None => store.create_branch(&name, &head, now_ms())?,
+            };
             println!("{}\t{}", branch.name, branch.head);
         }
         Command::Translate {
@@ -116,10 +161,13 @@ async fn main() -> Result<()> {
             model,
             target_language,
             source_language,
+            game,
+            game_name,
             text,
             image,
             audio,
             system_prompt,
+            user_prompt,
             endless_context,
             endless_context_scratchpad,
         } => {
@@ -144,6 +192,16 @@ async fn main() -> Result<()> {
                 },
             )?;
             let mut engine = TranslationEngine::new(store, Arc::new(provider));
+            if let Some(game) = game {
+                engine.set_game(GameIdentity::from_stable_key(
+                    &game,
+                    game_name,
+                    game.clone(),
+                    None,
+                    "cli",
+                    "cli",
+                ));
+            }
             engine.add_processor(Arc::new(NormalizeWhitespace));
             let captured_at_ms = now_ms();
             let mut inputs = text
@@ -187,6 +245,7 @@ async fn main() -> Result<()> {
                     branch,
                     created_at_ms: captured_at_ms,
                     system_prompt,
+                    user_prompt,
                     source_language,
                     target_language,
                     context_mode: if endless_context {
@@ -202,9 +261,13 @@ async fn main() -> Result<()> {
             println!("{}", commit.translated_text);
             eprintln!("commit {}", commit.id);
         }
-        Command::MergePlan { left, right } => {
-            let left = resolve_ref(&store, &left)?;
-            let right = resolve_ref(&store, &right)?;
+        Command::MergePlan { left, right, game } => {
+            let _game_identity = game
+                .as_deref()
+                .map(|game| ensure_cli_game(&mut store, game))
+                .transpose()?;
+            let left = resolve_ref_for_game(&store, game.as_deref(), &left)?;
+            let right = resolve_ref_for_game(&store, game.as_deref(), &right)?;
             let (base, plan) = store.plan_merge(&left, &right)?;
             println!(
                 "{}",
@@ -223,14 +286,36 @@ async fn main() -> Result<()> {
             context,
             target_branch,
             message,
+            game,
         } => {
-            let left = resolve_ref(&store, &left)?;
-            let right = resolve_ref(&store, &right)?;
+            let game_identity = game
+                .as_deref()
+                .map(|game| ensure_cli_game(&mut store, game))
+                .transpose()?;
+            let left = resolve_ref_for_game(&store, game.as_deref(), &left)?;
+            let right = resolve_ref_for_game(&store, game.as_deref(), &right)?;
             let context: ContextSnapshot = serde_json::from_slice(
                 &fs::read(&context).with_context(|| format!("read {}", context.display()))?,
             )?;
-            let commit = store.create_merge_commit(left, right, context, now_ms(), message)?;
-            store.create_branch(&target_branch, &commit.id, now_ms())?;
+            let commit = match game_identity.as_ref() {
+                Some(game) => store.create_game_merge_commit(
+                    &game.id,
+                    left,
+                    right,
+                    context,
+                    now_ms(),
+                    message,
+                )?,
+                None => store.create_merge_commit(left, right, context, now_ms(), message)?,
+            };
+            match game_identity.as_ref() {
+                Some(game) => {
+                    store.create_game_branch(&game.id, &target_branch, &commit.id, now_ms())?;
+                }
+                None => {
+                    store.create_branch(&target_branch, &commit.id, now_ms())?;
+                }
+            }
             println!("{}", commit.id);
         }
     }
@@ -272,6 +357,39 @@ fn resolve_ref(store: &SessionStore, reference: &str) -> Result<CommitId> {
     let id = CommitId(reference.to_owned());
     store.get_commit(&id)?;
     Ok(id)
+}
+
+fn cli_game_identity(stable_key: &str) -> GameIdentity {
+    GameIdentity::from_stable_key(stable_key, "CLI game", stable_key, None, "cli", "cli")
+}
+
+fn ensure_cli_game(store: &mut SessionStore, stable_key: &str) -> Result<GameIdentity> {
+    let identity = cli_game_identity(stable_key);
+    match store.game(&identity.id) {
+        Ok(existing) => Ok(existing),
+        Err(StoreError::GameNotFound(_)) => {
+            store.ensure_game(&identity, now_ms())?;
+            Ok(identity)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn resolve_ref_for_game(
+    store: &SessionStore,
+    game: Option<&str>,
+    reference: &str,
+) -> Result<CommitId> {
+    if let Some(game) = game {
+        let identity = cli_game_identity(game);
+        if let Ok(branch) = store.game_branch(&identity.id, reference) {
+            return Ok(branch.head);
+        }
+        let id = CommitId(reference.to_owned());
+        store.get_commit(&id)?;
+        return Ok(id);
+    }
+    resolve_ref(store, reference)
 }
 
 fn image_media_type(path: &Path) -> Result<&'static str> {

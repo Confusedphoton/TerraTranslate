@@ -19,15 +19,15 @@ use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 use secrecy::SecretString;
 use terratranslate_core::{
-    ContextSnapshot, ModelMetadata, NormalizeWhitespace, ScratchpadAuthor, ScratchpadEdit,
-    SourceKind, TranslationCommit,
+    ContextSnapshot, GameIdentity, ModelMetadata, NormalizeWhitespace, ScratchpadAuthor,
+    ScratchpadEdit, SourceKind, TranslationCommit,
 };
 use terratranslate_engine::{
     ContextMode, TextInputOptions, TextProcessingSelection, TranslationEngine, TurnInput,
     TurnRequest,
 };
 use terratranslate_platform_linux::{
-    DesktopCapabilities, DisplayServer, NativeApplication, NativeLaunchRequest,
+    DesktopCapabilities, DisplayServer, HookBridgeIdentity, NativeApplication, NativeLaunchRequest,
     NativeTextHookEvent, NativeTextHookService, PortalFrameReceiver, PortalShortcutSession,
     PortalStream, ShortcutBinding, VisionFrameCache, VisionFrameCacheConfig, WindowCaptureSession,
     WineArtifacts, WineHookEvent, WineHookService, WineTarget, attach_wine_target,
@@ -90,6 +90,7 @@ struct ModelSettings {
     source_language: String,
     target_language: String,
     system_prompt: String,
+    user_prompt: String,
 }
 
 impl Default for ModelSettings {
@@ -100,12 +101,14 @@ impl Default for ModelSettings {
             source_language: String::new(),
             target_language: "English".into(),
             system_prompt: "Translate faithfully while preserving character voice.".into(),
+            user_prompt: "Translate every text hook into {{target_language}} in order.\n\n{{texts|enumerate}}".into(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct PendingHookText {
+    game: Option<GameIdentity>,
     hook_id: String,
     captured_at_ms: i64,
     source: SourceKind,
@@ -121,6 +124,7 @@ struct AppModel {
     branch_input: String,
     scratchpad_input: String,
     branches: String,
+    active_game: Option<GameIdentity>,
     active_branch: String,
     capture_streams: Vec<PortalStream>,
     capture_session: Option<WindowCaptureSession>,
@@ -207,6 +211,8 @@ enum AppMsg {
     ModelName(String),
     SourceLanguage(String),
     TargetLanguage(String),
+    SystemPrompt(String),
+    UserPrompt(String),
 }
 
 #[derive(Debug)]
@@ -539,6 +545,40 @@ impl Component for AppModel {
                                             },
                                         },
                                     },
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "System prompt",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_text: &model.model_settings.system_prompt,
+                                            set_placeholder_text: Some("Instructions for the model; macros such as {{game.name}} are expanded"),
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::SystemPrompt(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
+                                    gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_spacing: 4,
+                                        set_hexpand: true,
+                                        gtk::Label {
+                                            set_label: "User prompt",
+                                            set_halign: gtk::Align::Start,
+                                        },
+                                        gtk::Entry {
+                                            set_hexpand: true,
+                                            set_text: &model.model_settings.user_prompt,
+                                            set_placeholder_text: Some("Use {{texts|enumerate}} or {{#each texts}}...{{/each}} for multiple hooks"),
+                                            connect_changed[sender] => move |entry| {
+                                                sender.input(AppMsg::UserPrompt(entry.text().to_string()));
+                                            },
+                                        },
+                                    },
                                 },
                             },
                             gtk::Frame {
@@ -865,6 +905,7 @@ impl Component for AppModel {
             branch_input: String::new(),
             scratchpad_input: String::new(),
             branches: String::new(),
+            active_game: None,
             active_branch: "main".into(),
             capture_streams: Vec::new(),
             capture_session: None,
@@ -1049,10 +1090,23 @@ impl Component for AppModel {
             }),
             AppMsg::BranchInput(value) => self.branch_input = value,
             AppMsg::CreateBranch => {
-                let result = self.store.branch(&self.active_branch).and_then(|branch| {
-                    self.store
-                        .create_branch(&self.branch_input, &branch.head, now_ms())
-                });
+                let result = match self.active_game.as_ref() {
+                    Some(game) => self
+                        .store
+                        .game_branch(&game.id, &self.active_branch)
+                        .and_then(|branch| {
+                            self.store.create_game_branch(
+                                &game.id,
+                                &self.branch_input,
+                                &branch.head,
+                                now_ms(),
+                            )
+                        }),
+                    None => self.store.branch(&self.active_branch).and_then(|branch| {
+                        self.store
+                            .create_branch(&self.branch_input, &branch.head, now_ms())
+                    }),
+                };
                 self.status = match result {
                     Ok(branch) => format!(
                         "Created branch {} at {}",
@@ -1290,6 +1344,14 @@ impl Component for AppModel {
                 self.model_settings.target_language = value;
                 self.save_model_settings();
             }
+            AppMsg::SystemPrompt(value) => {
+                self.model_settings.system_prompt = value;
+                self.save_model_settings();
+            }
+            AppMsg::UserPrompt(value) => {
+                self.model_settings.user_prompt = value;
+                self.save_model_settings();
+            }
         }
     }
 
@@ -1462,6 +1524,42 @@ impl Component for AppModel {
 }
 
 impl AppModel {
+    fn native_game_identity(&self, application_id: &str) -> GameIdentity {
+        let application_name = self
+            .native_applications
+            .iter()
+            .find(|application| application.id == application_id)
+            .map(|application| application.name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(application_id);
+        GameIdentity::from_stable_key(
+            format!("native:{application_name}"),
+            application_name,
+            application_name,
+            None,
+            "linux",
+            "native",
+        )
+    }
+
+    fn activate_game(&mut self, game: GameIdentity) {
+        if self
+            .active_game
+            .as_ref()
+            .is_some_and(|active| active.id == game.id)
+        {
+            return;
+        }
+        if let Err(error) = self.store.ensure_game(&game, now_ms()) {
+            self.status = format!("Could not initialize {} history: {error}", game.name);
+            return;
+        }
+        self.active_game = Some(game.clone());
+        self.active_branch = "main".into();
+        self.refresh_branches();
+        self.status = format!("Using per-game history for {}.", game.name);
+    }
+
     fn wine_target_details(&self) -> String {
         let Some(target) = self
             .wine_target_selection
@@ -1512,6 +1610,7 @@ impl AppModel {
                     };
                 }
                 NativeTextHookEvent::Text(event) => {
+                    self.activate_game(self.native_game_identity(&event.application_id));
                     let hook_id = format!("native:{}:{}", event.application_id, event.object_path);
                     self.native_hook_status = format!(
                         "Hooked native text from {} ({}) at {}.",
@@ -1525,6 +1624,7 @@ impl AppModel {
                         event.text.clone(),
                     );
                     self.queue_hook_text(PendingHookText {
+                        game: self.active_game.clone(),
                         hook_id,
                         captured_at_ms: event.timestamp_ms,
                         source: SourceKind::NativeHook,
@@ -1546,6 +1646,7 @@ impl AppModel {
         while let Ok(event) = self.wine_hook_service.try_recv() {
             match event {
                 WineHookEvent::Connected { bridge } => {
+                    self.activate_game(game_identity_from_bridge(&bridge));
                     self.wine_hook_status = format!(
                         "Text hook attached to {} (PID {}, {:?}).",
                         bridge.executable.path, bridge.process_id, bridge.runtime
@@ -1553,6 +1654,7 @@ impl AppModel {
                     self.status = self.wine_hook_status.clone();
                 }
                 WineHookEvent::Candidate { bridge, candidate } => {
+                    self.activate_game(game_identity_from_bridge(&bridge));
                     let hook_id = candidate.stable_key.to_string();
                     let executable = bridge.executable.path.clone();
                     let callsite = match (&candidate.caller_module, candidate.module_offset) {
@@ -1588,6 +1690,7 @@ impl AppModel {
                     );
                 }
                 WineHookEvent::Text { bridge, event } => {
+                    self.activate_game(game_identity_from_bridge(&bridge));
                     let hook_id = event.stable_key.to_string();
                     if self.hook_routes.get(&hook_id)
                         != Some(&(bridge.bridge_id, event.candidate_id))
@@ -1621,6 +1724,7 @@ impl AppModel {
                         );
                     }
                     self.queue_hook_text(PendingHookText {
+                        game: self.active_game.clone(),
                         hook_id,
                         captured_at_ms: event.timestamp_ms,
                         source: if matches!(bridge.runtime, HookRuntime::Native) {
@@ -1777,6 +1881,11 @@ impl AppModel {
             .expect("queue was checked above")
             .config
             .post_processors();
+        let first_game_id = self
+            .pending_hook_text
+            .front()
+            .and_then(|pending| pending.game.as_ref())
+            .map(|game| game.id.clone());
         let first_timestamp = self
             .pending_hook_text
             .front()
@@ -1789,7 +1898,9 @@ impl AppModel {
                 .pending_hook_text
                 .pop_front()
                 .expect("queue length is stable during grouping");
-            if pending.config.post_processors() == first_post_processors
+            let same_game = pending.game.as_ref().map(|game| game.id.clone()) == first_game_id;
+            if same_game
+                && pending.config.post_processors() == first_post_processors
                 && pending.captured_at_ms.abs_diff(first_timestamp) <= 100
             {
                 batch.push(pending);
@@ -1814,11 +1925,12 @@ impl AppModel {
         let data_dir = self.data_dir.clone();
         let settings = self.model_settings.clone();
         let branch = self.active_branch.clone();
+        let game = batch.first().and_then(|pending| pending.game.clone());
         sender.oneshot_command(async move {
             CommandOutput::Translation {
                 hook_ids,
                 result: Box::new(
-                    translate_hook_batch(data_dir, branch, settings, context_mode, batch)
+                    translate_hook_batch(data_dir, branch, game, settings, context_mode, batch)
                         .await
                         .map_err(|error| format!("{error:#}")),
                 ),
@@ -1852,7 +1964,11 @@ impl AppModel {
     }
 
     fn refresh_branches(&mut self) {
-        self.branches = match self.store.list_branches() {
+        let branches = match self.active_game.as_ref() {
+            Some(game) => self.store.list_game_branches(&game.id),
+            None => self.store.list_branches(),
+        };
+        self.branches = match branches {
             Ok(branches) => branches
                 .iter()
                 .map(|branch| {
@@ -1871,7 +1987,10 @@ impl AppModel {
 
     fn commit_scratchpad(&mut self) {
         let result = (|| -> Result<()> {
-            let branch = self.store.branch(&self.active_branch)?;
+            let branch = match self.active_game.as_ref() {
+                Some(game) => self.store.game_branch(&game.id, &self.active_branch)?,
+                None => self.store.branch(&self.active_branch)?,
+            };
             let parent = self.store.get_commit(&branch.head)?;
             let previous_digest = blake3::hash(parent.context.scratchpad.as_bytes())
                 .to_hex()
@@ -1899,12 +2018,22 @@ impl AppModel {
                 "Update scratchpad".into(),
             )?;
             self.store.put_commit(&commit)?;
-            if !self.store.advance_branch(
-                &self.active_branch,
-                &branch.head,
-                &commit.id,
-                now_ms(),
-            )? {
+            let advanced = match self.active_game.as_ref() {
+                Some(game) => self.store.advance_game_branch(
+                    &game.id,
+                    &self.active_branch,
+                    &branch.head,
+                    &commit.id,
+                    now_ms(),
+                )?,
+                None => self.store.advance_branch(
+                    &self.active_branch,
+                    &branch.head,
+                    &commit.id,
+                    now_ms(),
+                )?,
+            };
+            if !advanced {
                 anyhow::bail!("branch moved while committing; retry the edit");
             }
             Ok(())
@@ -1948,6 +2077,7 @@ fn native_preload_library_path() -> PathBuf {
 async fn translate_hook_batch(
     data_dir: PathBuf,
     branch: String,
+    game: Option<GameIdentity>,
     settings: ModelSettings,
     context_mode: ContextMode,
     batch: Vec<PendingHookText>,
@@ -1969,13 +2099,15 @@ async fn translate_hook_batch(
         },
     )?;
     let mut engine = TranslationEngine::new(store, Arc::new(provider));
+    if let Some(game) = game {
+        engine.set_game(game);
+    }
     engine.add_processor(Arc::new(NormalizeWhitespace));
     let created_at_ms = batch
         .iter()
         .map(|pending| pending.captured_at_ms)
         .max()
         .unwrap_or_else(now_ms);
-    let multiple_hooks = batch.len() > 1;
     let inputs = batch
         .into_iter()
         .map(|pending| TurnInput {
@@ -1993,17 +2125,12 @@ async fn translate_hook_batch(
             }),
         })
         .collect();
-    let mut system_prompt = settings.system_prompt;
-    if multiple_hooks {
-        system_prompt.push_str(
-            " Translate every text-hook input in the same order. Keep distinct labeled hooks clearly separated in the result.",
-        );
-    }
     engine
         .translate_turn(TurnRequest {
             branch,
             created_at_ms,
-            system_prompt,
+            system_prompt: settings.system_prompt,
+            user_prompt: settings.user_prompt,
             source_language: (!settings.source_language.trim().is_empty())
                 .then(|| settings.source_language.trim().to_owned()),
             target_language: settings.target_language.trim().to_owned(),
@@ -2097,6 +2224,26 @@ fn native_application_option_label(application: &NativeApplication) -> String {
     } else {
         application.name.clone()
     }
+}
+
+fn game_identity_from_bridge(bridge: &HookBridgeIdentity) -> GameIdentity {
+    let name = bridge
+        .executable
+        .path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&bridge.executable.path)
+        .trim_end_matches(".exe")
+        .to_owned();
+    GameIdentity::from_stable_key(
+        bridge.executable.stable_id(&bridge.platform),
+        name,
+        bridge.executable.path.clone(),
+        bridge.executable.image_id.clone(),
+        format!("{:?}", bridge.platform).to_ascii_lowercase(),
+        format!("{:?}", bridge.runtime).to_ascii_lowercase(),
+    )
 }
 
 fn start_wine_hook(data_dir: &Path) -> Result<(WineHookService, PathBuf)> {

@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use terratranslate_core::{
-    BranchRef, CommitId, ContextSnapshot, MergePlan, ModelMetadata, TranslationCommit,
-    plan_context_merge,
+    BranchRef, CommitId, ContextSnapshot, GameId, GameIdentity, MergePlan, ModelMetadata,
+    TranslationCommit, plan_context_merge,
 };
+
+pub const DEFAULT_GAME_ID: &str = "default";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -22,6 +24,10 @@ pub enum StoreError {
     CommitNotFound(CommitId),
     #[error("branch {0:?} was not found")]
     BranchNotFound(String),
+    #[error("game {0} was not found")]
+    GameNotFound(GameId),
+    #[error("game ID must not be blank or contain whitespace")]
+    InvalidGameId,
     #[error("branch name must not be blank or contain whitespace")]
     InvalidBranchName,
     #[error("commit ID does not match its content")]
@@ -84,12 +90,209 @@ impl SessionStore {
                  head_id TEXT NOT NULL REFERENCES commits(id),
                  updated_at_ms INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS games (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 executable_path TEXT NOT NULL,
+                 image_id TEXT,
+                 platform TEXT NOT NULL,
+                 runtime TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS game_branches (
+                 game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                 name TEXT NOT NULL,
+                 head_id TEXT NOT NULL REFERENCES commits(id),
+                 updated_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY(game_id, name)
+             );
+             CREATE INDEX IF NOT EXISTS game_branches_head ON game_branches(head_id);
              CREATE TABLE IF NOT EXISTS settings (
                  key TEXT PRIMARY KEY,
                  value_json TEXT NOT NULL
              );",
         )?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO games(
+                 id, name, executable_path, image_id, platform, runtime, updated_at_ms
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0)",
+            params![DEFAULT_GAME_ID, "Default session", "", "unknown", "unknown"],
+        )?;
+        // Databases created before game namespaces had one unscoped branch table. Copy
+        // those refs into the default game exactly once; the compatibility methods below
+        // use game_branches from then on.
+        self.connection.execute(
+            "INSERT OR IGNORE INTO game_branches(game_id, name, head_id, updated_at_ms)
+             SELECT ?1, name, head_id, updated_at_ms FROM branches",
+            [DEFAULT_GAME_ID],
+        )?;
         Ok(())
+    }
+
+    /// Register a game identity and create its independent `main` history if needed.
+    pub fn ensure_game(
+        &mut self,
+        identity: &GameIdentity,
+        updated_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        validate_game_id(&identity.id)?;
+        self.connection.execute(
+            "INSERT INTO games(
+                 id, name, executable_path, image_id, platform, runtime, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 executable_path = excluded.executable_path,
+                 image_id = excluded.image_id,
+                 platform = excluded.platform,
+                 runtime = excluded.runtime,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                identity.id.0,
+                identity.name,
+                identity.executable_path,
+                identity.image_id,
+                identity.platform,
+                identity.runtime,
+                updated_at_ms
+            ],
+        )?;
+        let has_main: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM game_branches WHERE game_id = ?1 AND name = 'main'
+             )",
+            [&identity.id.0],
+            |row| row.get(0),
+        )?;
+        if !has_main {
+            let root = TranslationCommit::create(
+                vec![],
+                updated_at_ms,
+                vec![],
+                String::new(),
+                String::new(),
+                ContextSnapshot::default(),
+                vec![],
+                vec![],
+                ModelMetadata::default(),
+                format!("Initialize {} history ({})", identity.name, identity.id),
+            )
+            .map_err(|_| StoreError::InvalidCommitId)?;
+            self.put_commit(&root)?;
+            self.create_game_branch(&identity.id, "main", &root.id, updated_at_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn game(&self, id: &GameId) -> Result<GameIdentity, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT name, executable_path, image_id, platform, runtime
+                 FROM games WHERE id = ?1",
+                [&id.0],
+                |row| {
+                    Ok(GameIdentity {
+                        id: id.clone(),
+                        name: row.get(0)?,
+                        executable_path: row.get(1)?,
+                        image_id: row.get(2)?,
+                        platform: row.get(3)?,
+                        runtime: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::GameNotFound(id.clone()))
+    }
+
+    pub fn list_games(&self) -> Result<Vec<GameIdentity>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, executable_path, image_id, platform, runtime
+             FROM games ORDER BY name, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(GameIdentity {
+                id: GameId(row.get(0)?),
+                name: row.get(1)?,
+                executable_path: row.get(2)?,
+                image_id: row.get(3)?,
+                platform: row.get(4)?,
+                runtime: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_game_branch(
+        &mut self,
+        game_id: &GameId,
+        name: &str,
+        head: &CommitId,
+        updated_at_ms: i64,
+    ) -> Result<BranchRef, StoreError> {
+        validate_game_id(game_id)?;
+        validate_branch_name(name)?;
+        self.game(game_id)?;
+        self.get_commit(head)?;
+        self.connection.execute(
+            "INSERT INTO game_branches(game_id, name, head_id, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(game_id, name) DO UPDATE SET
+                 head_id = excluded.head_id,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![game_id.0, name, head.0, updated_at_ms],
+        )?;
+        Ok(BranchRef {
+            name: name.to_owned(),
+            head: head.clone(),
+            updated_at_ms,
+        })
+    }
+
+    pub fn game_branch(&self, game_id: &GameId, name: &str) -> Result<BranchRef, StoreError> {
+        validate_game_id(game_id)?;
+        self.game(game_id)?;
+        self.connection
+            .query_row(
+                "SELECT head_id, updated_at_ms FROM game_branches
+                 WHERE game_id = ?1 AND name = ?2",
+                params![game_id.0, name],
+                |row| {
+                    Ok(BranchRef {
+                        name: name.to_owned(),
+                        head: CommitId(row.get(0)?),
+                        updated_at_ms: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_owned()))
+    }
+
+    pub fn list_game_branches(&self, game_id: &GameId) -> Result<Vec<BranchRef>, StoreError> {
+        validate_game_id(game_id)?;
+        self.game(game_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT name, head_id, updated_at_ms FROM game_branches
+             WHERE game_id = ?1 ORDER BY name",
+        )?;
+        let rows = statement.query_map([&game_id.0], |row| {
+            Ok(BranchRef {
+                name: row.get(0)?,
+                head: CommitId(row.get(1)?),
+                updated_at_ms: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn game_branch_history(
+        &self,
+        game_id: &GameId,
+        name: &str,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        let head = self.game_branch(game_id, name)?.head;
+        self.history_from_head(head)
     }
 
     pub fn put_commit(&mut self, commit: &TranslationCommit) -> Result<(), StoreError> {
@@ -139,49 +342,15 @@ impl SessionStore {
         head: &CommitId,
         updated_at_ms: i64,
     ) -> Result<BranchRef, StoreError> {
-        validate_branch_name(name)?;
-        self.get_commit(head)?;
-        self.connection.execute(
-            "INSERT INTO branches(name, head_id, updated_at_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET head_id = excluded.head_id, updated_at_ms = excluded.updated_at_ms",
-            params![name, head.0, updated_at_ms],
-        )?;
-        Ok(BranchRef {
-            name: name.to_owned(),
-            head: head.clone(),
-            updated_at_ms,
-        })
+        self.create_game_branch(&default_game_id(), name, head, updated_at_ms)
     }
 
     pub fn branch(&self, name: &str) -> Result<BranchRef, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT head_id, updated_at_ms FROM branches WHERE name = ?1",
-                [name],
-                |row| {
-                    Ok(BranchRef {
-                        name: name.to_owned(),
-                        head: CommitId(row.get(0)?),
-                        updated_at_ms: row.get(1)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::BranchNotFound(name.to_owned()))
+        self.game_branch(&default_game_id(), name)
     }
 
     pub fn list_branches(&self) -> Result<Vec<BranchRef>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT name, head_id, updated_at_ms FROM branches ORDER BY name")?;
-        let rows = statement.query_map([], |row| {
-            Ok(BranchRef {
-                name: row.get(0)?,
-                head: CommitId(row.get(1)?),
-                updated_at_ms: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.list_game_branches(&default_game_id())
     }
 
     /// Return every commit reachable from a branch head in oldest-first order.
@@ -190,7 +359,10 @@ impl SessionStore {
     /// complete context graph represented by the branch rather than only its
     /// first-parent presentation.
     pub fn branch_history(&self, name: &str) -> Result<Vec<TranslationCommit>, StoreError> {
-        let head = self.branch(name)?.head;
+        self.game_branch_history(&default_game_id(), name)
+    }
+
+    fn history_from_head(&self, head: CommitId) -> Result<Vec<TranslationCommit>, StoreError> {
         let mut seen = HashSet::new();
         let mut history = Vec::new();
         let mut stack = vec![(head, false)];
@@ -223,8 +395,33 @@ impl SessionStore {
     ) -> Result<bool, StoreError> {
         self.get_commit(new_head)?;
         let changed = self.connection.execute(
-            "UPDATE branches SET head_id = ?1, updated_at_ms = ?2 WHERE name = ?3 AND head_id = ?4",
-            params![new_head.0, updated_at_ms, name, expected_head.0],
+            "UPDATE game_branches SET head_id = ?1, updated_at_ms = ?2
+             WHERE game_id = ?3 AND name = ?4 AND head_id = ?5",
+            params![
+                new_head.0,
+                updated_at_ms,
+                DEFAULT_GAME_ID,
+                name,
+                expected_head.0
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn advance_game_branch(
+        &mut self,
+        game_id: &GameId,
+        name: &str,
+        expected_head: &CommitId,
+        new_head: &CommitId,
+        updated_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.game_branch(game_id, name)?;
+        self.get_commit(new_head)?;
+        let changed = self.connection.execute(
+            "UPDATE game_branches SET head_id = ?1, updated_at_ms = ?2
+             WHERE game_id = ?3 AND name = ?4 AND head_id = ?5",
+            params![new_head.0, updated_at_ms, game_id.0, name, expected_head.0],
         )?;
         Ok(changed == 1)
     }
@@ -267,6 +464,26 @@ impl SessionStore {
         created_at_ms: i64,
         message: String,
     ) -> Result<TranslationCommit, StoreError> {
+        self.create_game_merge_commit(
+            &default_game_id(),
+            left,
+            right,
+            context,
+            created_at_ms,
+            message,
+        )
+    }
+
+    pub fn create_game_merge_commit(
+        &mut self,
+        game_id: &GameId,
+        left: CommitId,
+        right: CommitId,
+        context: ContextSnapshot,
+        created_at_ms: i64,
+        message: String,
+    ) -> Result<TranslationCommit, StoreError> {
+        self.game(game_id)?;
         self.get_commit(&left)?;
         self.get_commit(&right)?;
         let commit = TranslationCommit::create(
@@ -342,6 +559,18 @@ fn validate_branch_name(name: &str) -> Result<(), StoreError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_game_id(id: &GameId) -> Result<(), StoreError> {
+    if id.0.is_empty() || id.0.chars().any(char::is_whitespace) {
+        Err(StoreError::InvalidGameId)
+    } else {
+        Ok(())
+    }
+}
+
+fn default_game_id() -> GameId {
+    GameId(DEFAULT_GAME_ID.to_owned())
 }
 
 #[cfg(test)]
@@ -449,5 +678,64 @@ mod tests {
     #[test]
     fn timestamp_source_is_available_for_clients() {
         assert!(SystemTime::now().duration_since(UNIX_EPOCH).is_ok());
+    }
+
+    #[test]
+    fn game_histories_keep_same_named_branches_independent() {
+        let mut store = SessionStore::in_memory(temp_blob_root()).unwrap();
+        let first_game = GameIdentity::from_stable_key(
+            "first.exe",
+            "First game",
+            "C:/first.exe",
+            None,
+            "windows",
+            "wine",
+        );
+        let second_game = GameIdentity::from_stable_key(
+            "second.exe",
+            "Second game",
+            "C:/second.exe",
+            None,
+            "windows",
+            "wine",
+        );
+        store.ensure_game(&first_game, 1).unwrap();
+        store.ensure_game(&second_game, 1).unwrap();
+
+        let first_root = store.game_branch(&first_game.id, "main").unwrap();
+        let second_root = store.game_branch(&second_game.id, "main").unwrap();
+        assert_ne!(first_root.head, second_root.head);
+
+        let first_turn = commit(Some(first_root.head.clone()), 2, "first turn");
+        let second_turn = commit(Some(second_root.head.clone()), 2, "second turn");
+        store.put_commit(&first_turn).unwrap();
+        store.put_commit(&second_turn).unwrap();
+        assert!(
+            store
+                .advance_game_branch(&first_game.id, "main", &first_root.head, &first_turn.id, 2,)
+                .unwrap()
+        );
+        assert!(
+            store
+                .advance_game_branch(
+                    &second_game.id,
+                    "main",
+                    &second_root.head,
+                    &second_turn.id,
+                    2,
+                )
+                .unwrap()
+        );
+
+        let first_history = store.game_branch_history(&first_game.id, "main").unwrap();
+        let second_history = store.game_branch_history(&second_game.id, "main").unwrap();
+        assert!(first_history.iter().any(|value| value.id == first_turn.id));
+        assert!(!first_history.iter().any(|value| value.id == second_turn.id));
+        assert!(
+            second_history
+                .iter()
+                .any(|value| value.id == second_turn.id)
+        );
+        assert!(!second_history.iter().any(|value| value.id == first_turn.id));
     }
 }

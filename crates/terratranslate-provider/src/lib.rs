@@ -27,6 +27,10 @@ pub enum ModelInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TranslationRequest {
     pub system_prompt: String,
+    /// A rendered user prompt. The provider still appends structured translation metadata
+    /// and sends each multimodal input separately after this text.
+    #[serde(default)]
+    pub user_prompt: String,
     pub inputs: Vec<ModelInput>,
     pub source_language: Option<String>,
     pub target_language: String,
@@ -144,17 +148,23 @@ impl OpenAiCompatibleProvider {
         let context_json = serde_json::to_string(&request.context).expect("context serializes");
         let history_json =
             serde_json::to_string(&request.context_history).expect("context history serializes");
+        let request_metadata = format!(
+            "Translate into {}. Source language: {}. Current versioned context: {}. Complete main-branch context history (oldest first): {}",
+            request.target_language,
+            request.source_language.as_deref().unwrap_or("auto-detect"),
+            context_json,
+            history_json
+        );
+        let user_prompt = if request.user_prompt.trim().is_empty() {
+            request_metadata
+        } else {
+            format!("{}\n\n{}", request.user_prompt.trim_end(), request_metadata)
+        };
         content.insert(
             0,
             json!({
                 "type": "text",
-                "text": format!(
-                    "Translate into {}. Source language: {}. Current versioned context: {}. Complete main-branch context history (oldest first): {}",
-                    request.target_language,
-                    request.source_language.as_deref().unwrap_or("auto-detect"),
-                    context_json,
-                    history_json
-                )
+                "text": user_prompt
             }),
         );
 
@@ -266,6 +276,7 @@ mod tests {
     fn request(input: ModelInput) -> TranslationRequest {
         TranslationRequest {
             system_prompt: "Translate faithfully".into(),
+            user_prompt: String::new(),
             inputs: vec![input],
             source_language: None,
             target_language: "English".into(),
@@ -308,6 +319,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request(ModelInput::Text("current".into()));
+        request.user_prompt = "Custom user instructions".into();
         request.context_history = vec![ContextHistoryEntry {
             source_text: "previous source".into(),
             translated_text: "previous translation".into(),
@@ -325,6 +337,7 @@ mod tests {
         assert!(prompt.contains("previous source"));
         assert!(prompt.contains("previous translation"));
         assert!(prompt.contains("previous summary"));
+        assert!(prompt.starts_with("Custom user instructions"));
     }
 
     #[test]

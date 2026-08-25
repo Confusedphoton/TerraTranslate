@@ -57,6 +57,13 @@ cargo run -p terratranslate-cli -- translate \
   --image frame.png \
   --audio dialogue.wav
 
+# Keep this turn in one stable game's independent history and customize the
+# rendered user prompt. --game is not a process ID.
+cargo run -p terratranslate-cli -- translate \
+  --game story.exe --game-name "My Story" \
+  --model your-multimodal-model --text 'こんにちは' \
+  --user-prompt 'Translate {{texts|enumerate}} into {{target_language}}.'
+
 cargo run -p terratranslate-cli -- branches
 cargo run -p terratranslate-cli -- audio-targets
 cargo run -p terratranslate-cli -- merge-plan branch-a branch-b
@@ -74,6 +81,9 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
 ## Implemented foundations
 
 - Content-addressed translation commits with zero, one, or two parents.
+- Independent Git-style `main` and named branch refs for every registered game. Existing
+  unscoped sessions migrate into the default game namespace, and stable executable/image
+  identities keep a game's history across process launches.
 - Named branches, atomic branch advancement, merge-base discovery, and manual three-way context
   merge plans for summaries, glossaries, entities, style, and scratchpad.
 - SQLite metadata and content-addressed local frame/audio/text blobs.
@@ -99,6 +109,11 @@ Set `RUST_LOG=debug` for diagnostic logging. Runtime state defaults to
   versioned user scratchpad edits. The main app discovers individual Wine hook candidates and
   native AT-SPI text objects, allows any number to be routed to the model, and persists optional
   per-hook labels plus independent pre-model and post-translation normalization choices.
+- Configurable system and user prompt templates are persisted in `model-settings.json`. Templates
+  support game/context macros such as `{{game.name}}`, `{{game.executable}}`, `{{context.summary}}`,
+  `{{source_language}}`, `{{target_language}}`, and `{{branch}}`. Use `{{texts|enumerate}}` or
+  `{{#each texts}}[{{number}}] {{label}}: {{text}}\n{{/each}}` to inject multiple selected text
+  hooks in a deterministic order; `trim`, `upper`, `lower`, and `json` filters are available.
 
 Semantic hooks are capture-only and cover common text APIs, not every renderer. Glyph-only
 FreeType/Cairo calls, custom GPU atlases, static or secure-exec native binaries, and other custom

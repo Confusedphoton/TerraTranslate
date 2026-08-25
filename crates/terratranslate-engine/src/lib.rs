@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use terratranslate_core::{
-    ContextHistoryEntry, ContextSnapshot, EventId, Modality, ModelMetadata, PayloadRef,
-    ProcessorRequest, ProcessorStage, ProcessorTrace, ScratchpadAuthor, ScratchpadEdit,
-    SourceEvent, SourceKind, TextProcessor, TranslationCommit,
+    ContextHistoryEntry, ContextSnapshot, EventId, GameId, GameIdentity, Modality, ModelMetadata,
+    PayloadRef, ProcessorRequest, ProcessorStage, ProcessorTrace, PromptData, PromptTemplate,
+    PromptText, ScratchpadAuthor, ScratchpadEdit, SourceEvent, SourceKind, TextProcessor,
+    TranslationCommit,
 };
 use terratranslate_provider::{
     ModelInput, ModelProvider, ProviderError, TranslationRequest, validate_request,
@@ -37,8 +38,8 @@ pub enum ContextMode {
     /// Use the context snapshot at the requested branch's current head.
     #[default]
     Current,
-    /// Send the complete `main` branch history and optionally reinsert only the
-    /// requested branch's current scratchpad.
+    /// Send the complete `main` branch history for the active game and optionally
+    /// reinsert only the requested branch's current scratchpad.
     Endless { include_scratchpad: bool },
 }
 
@@ -55,6 +56,7 @@ pub struct TurnRequest {
     pub branch: String,
     pub created_at_ms: i64,
     pub system_prompt: String,
+    pub user_prompt: String,
     pub source_language: Option<String>,
     pub target_language: String,
     pub context_mode: ContextMode,
@@ -79,12 +81,15 @@ pub enum EngineError {
     EmptyTurn,
     #[error("text inputs in one model turn selected different post-processing pipelines")]
     IncompatiblePostProcessing,
+    #[error("prompt template could not be rendered: {0}")]
+    Prompt(String),
 }
 
 pub struct TranslationEngine {
     store: SessionStore,
     provider: Arc<dyn ModelProvider>,
     processors: Vec<Arc<dyn TextProcessor>>,
+    game: Option<GameIdentity>,
 }
 
 impl TranslationEngine {
@@ -93,7 +98,30 @@ impl TranslationEngine {
             store,
             provider,
             processors: Vec::new(),
+            game: None,
         }
+    }
+
+    pub fn for_game(
+        store: SessionStore,
+        provider: Arc<dyn ModelProvider>,
+        game: GameIdentity,
+    ) -> Self {
+        let mut engine = Self::new(store, provider);
+        engine.set_game(game);
+        engine
+    }
+
+    /// Attach subsequent turns to one game's independent history namespace.
+    ///
+    /// The identity's ID is stable across process launches; process IDs and hook
+    /// connection UUIDs are intentionally not part of it.
+    pub fn set_game(&mut self, game: GameIdentity) {
+        self.game = Some(game);
+    }
+
+    pub fn game(&self) -> Option<&GameIdentity> {
+        self.game.as_ref()
     }
 
     pub fn add_processor(&mut self, processor: Arc<dyn TextProcessor>) {
@@ -111,18 +139,34 @@ impl TranslationEngine {
         if turn.inputs.is_empty() {
             return Err(EngineError::EmptyTurn);
         }
-        let branch = self.store.branch(&turn.branch)?;
+        let game_id = if let Some(game) = &self.game {
+            self.store.ensure_game(game, turn.created_at_ms)?;
+            Some(game.id.clone())
+        } else {
+            None
+        };
+        let branch = match game_id.as_ref() {
+            Some(game_id) => self.store.game_branch(game_id, &turn.branch)?,
+            None => self.store.branch(&turn.branch)?,
+        };
         let parent = self.store.get_commit(&branch.head)?;
-        let (mut context, context_history, retain_scratchpad) =
-            self.prepare_context(parent.context, turn.context_mode)?;
+        let (mut context, context_history, retain_scratchpad) = self.prepare_context(
+            parent.context,
+            turn.context_mode,
+            game_id.as_ref(),
+            &turn.branch,
+        )?;
         let mut source_events = Vec::new();
         let mut model_inputs = Vec::new();
         let mut source_text_parts = Vec::new();
+        let mut prompt_texts = Vec::new();
         let mut trace = Vec::new();
         let mut post_translation_selection: Option<Option<Vec<String>>> = None;
         let processors = self.processors.clone();
 
         for input in turn.inputs {
+            let input_source = input.source.clone();
+            let input_target = input.target.clone();
             let (modality, media_type, bytes) = match &input.input {
                 ModelInput::Text(text) => (
                     Modality::Text,
@@ -173,8 +217,8 @@ impl TranslationEngine {
                 id: EventId::new(),
                 captured_at_ms: input.captured_at_ms,
                 modality,
-                source: input.source,
-                target: input.target,
+                source: input_source.clone(),
+                target: input_target.clone(),
                 payload,
                 metadata,
             });
@@ -196,6 +240,20 @@ impl TranslationEngine {
                     )
                     .await?;
                     source_text_parts.push(processed.clone());
+                    prompt_texts.push(PromptText {
+                        index: prompt_texts.len() + 1,
+                        hook_id: input
+                            .text_options
+                            .as_ref()
+                            .and_then(|options| options.stable_hook_key.clone()),
+                        label: input
+                            .text_options
+                            .as_ref()
+                            .and_then(|options| options.label.clone()),
+                        text: processed.clone(),
+                        source: source_kind_name(&input_source).into(),
+                        target: input_target.clone(),
+                    });
                     model_inputs.push(ModelInput::Text(label_text_input(
                         input
                             .text_options
@@ -220,8 +278,23 @@ impl TranslationEngine {
             }
         }
 
+        let prompt_data = PromptData {
+            game: self.game.clone(),
+            source_language: turn.source_language.clone(),
+            target_language: turn.target_language.clone(),
+            branch: turn.branch.clone(),
+            context: context.clone(),
+            texts: prompt_texts,
+        };
+        let system_prompt = PromptTemplate::new(turn.system_prompt)
+            .render(&prompt_data)
+            .map_err(|error| EngineError::Prompt(error.to_string()))?;
+        let user_prompt = PromptTemplate::new(turn.user_prompt)
+            .render(&prompt_data)
+            .map_err(|error| EngineError::Prompt(error.to_string()))?;
         let model_request = TranslationRequest {
-            system_prompt: turn.system_prompt,
+            system_prompt,
+            user_prompt,
             inputs: model_inputs,
             source_language: turn.source_language,
             target_language: turn.target_language,
@@ -286,10 +359,22 @@ impl TranslationEngine {
         )
         .map_err(|error| EngineError::Commit(error.to_string()))?;
         self.store.put_commit(&commit)?;
-        if !self
-            .store
-            .advance_branch(&turn.branch, &branch.head, &commit.id, turn.created_at_ms)?
-        {
+        let advanced = match game_id.as_ref() {
+            Some(game_id) => self.store.advance_game_branch(
+                game_id,
+                &turn.branch,
+                &branch.head,
+                &commit.id,
+                turn.created_at_ms,
+            )?,
+            None => self.store.advance_branch(
+                &turn.branch,
+                &branch.head,
+                &commit.id,
+                turn.created_at_ms,
+            )?,
+        };
+        if !advanced {
             return Err(EngineError::BranchMoved);
         }
         Ok(commit)
@@ -299,14 +384,24 @@ impl TranslationEngine {
         &self,
         current_context: ContextSnapshot,
         mode: ContextMode,
+        game_id: Option<&GameId>,
+        branch_name: &str,
     ) -> Result<(ContextSnapshot, Vec<ContextHistoryEntry>, bool), EngineError> {
         match mode {
             ContextMode::Current => Ok((current_context, vec![], true)),
             ContextMode::Endless { include_scratchpad } => {
-                let history = self.store.branch_history("main")?;
+                let history = match game_id {
+                    Some(game_id) => self.store.game_branch_history(game_id, "main")?,
+                    None => self.store.branch_history("main")?,
+                };
+                let current_branch_history = match game_id {
+                    Some(game_id) => self.store.game_branch_history(game_id, branch_name)?,
+                    None => self.store.branch_history(branch_name)?,
+                };
                 let current_scratchpad = current_context.scratchpad.clone();
                 let mut context = history
                     .last()
+                    .or_else(|| current_branch_history.last())
                     .map(|commit| commit.context.clone())
                     .unwrap_or(current_context);
                 context.scratchpad = if include_scratchpad {
@@ -426,6 +521,17 @@ fn aggregate_processor_metadata(
         }
     }
     metadata
+}
+
+fn source_kind_name(source: &SourceKind) -> &'static str {
+    match source {
+        SourceKind::WineHook => "wine_hook",
+        SourceKind::NativeHook => "native_hook",
+        SourceKind::WindowCapture => "window_capture",
+        SourceKind::ApplicationAudio => "application_audio",
+        SourceKind::Manual => "manual",
+        SourceKind::Import => "import",
+    }
 }
 
 fn label_text_input(label: Option<&str>, text: String) -> String {
@@ -613,6 +719,7 @@ mod tests {
             branch: "main".into(),
             created_at_ms: 2,
             system_prompt: "Translate".into(),
+            user_prompt: String::new(),
             source_language: None,
             target_language: "English".into(),
             context_mode,
@@ -702,6 +809,7 @@ mod tests {
                 branch: "main".into(),
                 created_at_ms: 2,
                 system_prompt: "Translate faithfully".into(),
+                user_prompt: String::new(),
                 source_language: Some("Japanese".into()),
                 target_language: "English".into(),
                 context_mode: ContextMode::Current,
@@ -753,6 +861,7 @@ mod tests {
                 branch: "main".into(),
                 created_at_ms: 2,
                 system_prompt: "Translate".into(),
+                user_prompt: String::new(),
                 source_language: None,
                 target_language: "English".into(),
                 context_mode: ContextMode::Current,
@@ -792,6 +901,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renders_game_prompts_and_advances_only_the_game_history() {
+        let store = initialized_store();
+        let default_head = store.branch("main").unwrap().head;
+        let game = GameIdentity::from_stable_key(
+            "prompt-game.exe",
+            "Prompt Game",
+            "C:/Games/prompt-game.exe",
+            None,
+            "windows",
+            "wine",
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ContextCaptureProvider {
+            requests: requests.clone(),
+        });
+        let mut engine = TranslationEngine::new(store, provider);
+        engine.set_game(game.clone());
+
+        let commit = engine
+            .translate_turn(TurnRequest {
+                branch: "main".into(),
+                created_at_ms: 2,
+                system_prompt: "Translate {{game.name}} into {{target_language}}".into(),
+                user_prompt: "{{#each texts}}[{{number}}] {{label}}: {{text}}\n{{/each}}".into(),
+                source_language: Some("Japanese".into()),
+                target_language: "English".into(),
+                context_mode: ContextMode::Current,
+                inputs: vec![
+                    TurnInput {
+                        captured_at_ms: 2,
+                        source: SourceKind::WineHook,
+                        target: "prompt-game.exe".into(),
+                        input: ModelInput::Text("こんにちは".into()),
+                        text_options: Some(TextInputOptions {
+                            stable_hook_key: Some("dialogue".into()),
+                            label: Some("Dialogue".into()),
+                            ..Default::default()
+                        }),
+                    },
+                    TurnInput {
+                        captured_at_ms: 2,
+                        source: SourceKind::WineHook,
+                        target: "prompt-game.exe".into(),
+                        input: ModelInput::Text("はい".into()),
+                        text_options: Some(TextInputOptions {
+                            stable_hook_key: Some("choice".into()),
+                            label: Some("Choice".into()),
+                            ..Default::default()
+                        }),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        let request = requests.lock().unwrap()[0].clone();
+        assert_eq!(request.system_prompt, "Translate Prompt Game into English");
+        assert!(request.user_prompt.contains("[1] Dialogue: こんにちは"));
+        assert!(request.user_prompt.contains("[2] Choice: はい"));
+        assert_eq!(engine.store().branch("main").unwrap().head, default_head);
+        assert_eq!(
+            engine.store().game_branch(&game.id, "main").unwrap().head,
+            commit.id
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_mixed_post_processing_in_one_model_turn() {
         let mut engine = TranslationEngine::new(initialized_store(), Arc::new(MockProvider));
         engine.add_processor(Arc::new(NormalizeWhitespace));
@@ -814,6 +990,7 @@ mod tests {
                 branch: "main".into(),
                 created_at_ms: 2,
                 system_prompt: "Translate".into(),
+                user_prompt: String::new(),
                 source_language: None,
                 target_language: "English".into(),
                 context_mode: ContextMode::Current,

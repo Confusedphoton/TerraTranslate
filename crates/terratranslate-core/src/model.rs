@@ -8,6 +8,61 @@ pub type TimestampMillis = i64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct GameId(pub String);
+
+impl fmt::Display for GameId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl GameId {
+    /// Derive a portable, non-path-bearing ID from a stable executable identity.
+    pub fn from_stable_key(stable_key: impl AsRef<str>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"terratranslate-game-v1\0");
+        hasher.update(stable_key.as_ref().as_bytes());
+        Self(hasher.finalize().to_hex().to_string())
+    }
+}
+
+/// Identity used to keep history and prompt configuration attached to one game.
+///
+/// `id` is deliberately independent of the process ID. A game launched again, or
+/// through another Wine process, therefore resumes the same history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameIdentity {
+    pub id: GameId,
+    pub name: String,
+    pub executable_path: String,
+    #[serde(default)]
+    pub image_id: Option<String>,
+    pub platform: String,
+    pub runtime: String,
+}
+
+impl GameIdentity {
+    pub fn from_stable_key(
+        stable_key: impl AsRef<str>,
+        name: impl Into<String>,
+        executable_path: impl Into<String>,
+        image_id: Option<String>,
+        platform: impl Into<String>,
+        runtime: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: GameId::from_stable_key(stable_key),
+            name: name.into(),
+            executable_path: executable_path.into(),
+            image_id,
+            platform: platform.into(),
+            runtime: runtime.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CommitId(pub String);
 
 impl fmt::Display for CommitId {
