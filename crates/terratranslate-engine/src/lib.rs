@@ -1,6 +1,13 @@
 //! End-to-end turn orchestration: persist inputs, process text, call a multimodal model, and
 //! atomically advance a branch.
 
+mod replay;
+
+pub use replay::{
+    ReplayCursor, ReplayStep, ResumeCandidate, candidate_path, find_resume_candidates,
+    is_structural_commit, rank_resume_candidates, uniquely_identified,
+};
+
 use std::sync::Arc;
 use std::time::Instant;
 

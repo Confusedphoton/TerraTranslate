@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use terratranslate_core::{
-    BranchRef, CommitId, ContextSnapshot, GameId, GameIdentity, MergePlan, ModelMetadata,
-    TranslationCommit, plan_context_merge,
+    BranchRef, CommitId, ContextSnapshot, GameId, GameIdentity, MergePlan, Modality, ModelMetadata,
+    TranslationCommit, TurnSignature, plan_context_merge,
 };
 
 pub const DEFAULT_GAME_ID: &str = "default";
@@ -43,6 +43,18 @@ pub enum StoreError {
 pub struct SessionStore {
     connection: Connection,
     blob_root: PathBuf,
+}
+
+/// The canonical replay presentation of one named branch.
+///
+/// A path follows only parent zero and is oldest-first.  Merge parents remain
+/// available through the existing full-DAG history APIs, but are intentionally
+/// not interleaved into replay so a shared commit appears at one deterministic
+/// position on every branch that reaches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayPath {
+    pub branch: BranchRef,
+    pub commits: Vec<TranslationCommit>,
 }
 
 impl SessionStore {
@@ -293,6 +305,129 @@ impl SessionStore {
     ) -> Result<Vec<TranslationCommit>, StoreError> {
         let head = self.game_branch(game_id, name)?.head;
         self.history_from_head(head)
+    }
+
+    /// Return a branch's oldest-first first-parent lineage.
+    pub fn game_branch_first_parent_history(
+        &self,
+        game_id: &GameId,
+        name: &str,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        let head = self.game_branch(game_id, name)?.head;
+        self.first_parent_history_from_head(&head)
+    }
+
+    /// Short alias for callers that already carry a game namespace.
+    pub fn first_parent_history(
+        &self,
+        game_id: &GameId,
+        name: &str,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        self.game_branch_first_parent_history(game_id, name)
+    }
+
+    /// Compatibility/default-game form of [`Self::game_branch_first_parent_history`].
+    pub fn branch_first_parent_history(
+        &self,
+        name: &str,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        let head = self.branch(name)?.head;
+        self.first_parent_history_from_head(&head)
+    }
+
+    pub fn first_parent_history_from(
+        &self,
+        head: &CommitId,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        self.first_parent_history_from_head(head)
+    }
+
+    /// Enumerate every named branch as an independent canonical replay path.
+    pub fn replay_paths(&self, game_id: &GameId) -> Result<Vec<ReplayPath>, StoreError> {
+        self.list_game_branches(game_id)?
+            .into_iter()
+            .map(|branch| {
+                let commits = self.first_parent_history_from_head(&branch.head)?;
+                Ok(ReplayPath { branch, commits })
+            })
+            .collect()
+    }
+
+    /// Explicitly named alias for the game-scoped replay query.
+    pub fn game_replay_paths(&self, game_id: &GameId) -> Result<Vec<ReplayPath>, StoreError> {
+        self.replay_paths(game_id)
+    }
+
+    /// Explicitly named alias useful to clients that distinguish the query from
+    /// the compatibility/default-game method.
+    pub fn replay_paths_for_game(&self, game_id: &GameId) -> Result<Vec<ReplayPath>, StoreError> {
+        self.replay_paths(game_id)
+    }
+
+    /// Enumerate replay paths in the compatibility/default game namespace.
+    pub fn default_replay_paths(&self) -> Result<Vec<ReplayPath>, StoreError> {
+        self.replay_paths(&default_game_id())
+    }
+
+    /// Reconstruct a text-turn signature from the existing payload blobs.
+    ///
+    /// Missing/non-text payloads are reported as `Ok(None)` so a damaged history
+    /// entry cannot cause automatic replay to fork or prevent ordinary translation.
+    pub fn commit_replay_signature(
+        &self,
+        commit: &TranslationCommit,
+    ) -> Result<Option<TurnSignature>, StoreError> {
+        if commit.parents.len() > 1
+            || commit.source_events.is_empty()
+            || commit.source_text.trim().is_empty()
+        {
+            return Ok(None);
+        }
+        let mut pairs = Vec::with_capacity(commit.source_events.len());
+        for event in &commit.source_events {
+            if event.modality != Modality::Text || !event.payload.media_type.starts_with("text/") {
+                return Ok(None);
+            }
+            let Some(hook) = event.metadata.get("stable_hook_key") else {
+                return Ok(None);
+            };
+            let bytes = match self.get_blob(&event.payload.digest) {
+                Ok(bytes) => bytes,
+                Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(_) => return Ok(None),
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                return Ok(None);
+            };
+            pairs.push((hook.clone(), text));
+        }
+        Ok(Some(TurnSignature::from_pairs(pairs)))
+    }
+
+    pub fn replay_signature(
+        &self,
+        commit: &TranslationCommit,
+    ) -> Result<Option<TurnSignature>, StoreError> {
+        self.commit_replay_signature(commit)
+    }
+
+    fn first_parent_history_from_head(
+        &self,
+        head: &CommitId,
+    ) -> Result<Vec<TranslationCommit>, StoreError> {
+        let mut reverse = Vec::new();
+        let mut current = head.clone();
+        loop {
+            let commit = self.get_commit(&current)?;
+            let parent = commit.parents.first().cloned();
+            reverse.push(commit);
+            let Some(parent) = parent else { break };
+            current = parent;
+        }
+        reverse.reverse();
+        Ok(reverse)
     }
 
     pub fn put_commit(&mut self, commit: &TranslationCommit) -> Result<(), StoreError> {
@@ -652,6 +787,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![root.id, left.id, right.id, merge.id]
         );
+    }
+
+    #[test]
+    fn first_parent_history_omits_side_parent_but_replay_paths_cover_all_branches() {
+        let mut store = SessionStore::in_memory(temp_blob_root()).unwrap();
+        let root = commit(None, 1, "root");
+        let left = commit(Some(root.id.clone()), 2, "left");
+        let right = commit(Some(root.id.clone()), 3, "right");
+        let merge = TranslationCommit::create(
+            vec![left.id.clone(), right.id.clone()],
+            4,
+            vec![],
+            String::new(),
+            String::new(),
+            ContextSnapshot::default(),
+            vec![],
+            vec![],
+            ModelMetadata::default(),
+            "merge".into(),
+        )
+        .unwrap();
+        for value in [&root, &left, &right, &merge] {
+            store.put_commit(value).unwrap();
+        }
+        store.create_branch("main", &merge.id, 4).unwrap();
+        store.create_branch("incomplete", &right.id, 3).unwrap();
+
+        let first_parent = store.branch_first_parent_history("main").unwrap();
+        assert_eq!(
+            first_parent
+                .iter()
+                .map(|value| value.id.clone())
+                .collect::<Vec<_>>(),
+            vec![root.id, left.id, merge.id]
+        );
+        let paths = store.default_replay_paths().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|path| path.branch.name == "incomplete"));
+    }
+
+    #[test]
+    fn missing_payload_disables_signature_without_failing_history() {
+        let mut store = SessionStore::in_memory(temp_blob_root()).unwrap();
+        let root = commit(None, 1, "root");
+        store.put_commit(&root).unwrap();
+        let event = terratranslate_core::SourceEvent {
+            id: terratranslate_core::EventId::new(),
+            captured_at_ms: 2,
+            modality: terratranslate_core::Modality::Text,
+            source: terratranslate_core::SourceKind::Manual,
+            target: "target".into(),
+            payload: terratranslate_core::PayloadRef {
+                digest: "0".repeat(64),
+                media_type: "text/plain".into(),
+                byte_len: 3,
+            },
+            metadata: [("stable_hook_key".into(), "hook".into())]
+                .into_iter()
+                .collect(),
+        };
+        let turn = TranslationCommit::create(
+            vec![root.id.clone()],
+            2,
+            vec![event],
+            "abc".into(),
+            "translated".into(),
+            ContextSnapshot::default(),
+            vec![],
+            vec![],
+            ModelMetadata::default(),
+            "turn".into(),
+        )
+        .unwrap();
+        assert!(store.commit_replay_signature(&turn).unwrap().is_none());
     }
 
     #[test]

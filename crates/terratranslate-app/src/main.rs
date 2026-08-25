@@ -19,12 +19,13 @@ use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 use secrecy::SecretString;
 use terratranslate_core::{
-    ContextSnapshot, GameIdentity, ModelMetadata, NormalizeWhitespace, ScratchpadAuthor,
-    ScratchpadEdit, SourceKind, TranslationCommit,
+    CommitId, ContextSnapshot, GameIdentity, ModelMetadata, NormalizeWhitespace, ScratchpadAuthor,
+    ScratchpadEdit, SourceKind, TranslationCommit, TurnSignature,
 };
 use terratranslate_engine::{
-    ContextMode, TextInputOptions, TextProcessingSelection, TranslationEngine, TurnInput,
-    TurnRequest,
+    ContextMode, ReplayCursor, ReplayStep, ResumeCandidate, TextInputOptions,
+    TextProcessingSelection, TranslationEngine, TurnInput, TurnRequest, find_resume_candidates,
+    uniquely_identified,
 };
 use terratranslate_platform_linux::{
     DesktopCapabilities, DisplayServer, HookBridgeIdentity, NativeApplication, NativeLaunchRequest,
@@ -35,7 +36,7 @@ use terratranslate_platform_linux::{
     register_shortcuts, select_window, steam_launch_option,
 };
 use terratranslate_provider::{ModelCapabilities, ModelInput, OpenAiCompatibleProvider};
-use terratranslate_store::SessionStore;
+use terratranslate_store::{ReplayPath, SessionStore};
 use terratranslate_wine_protocol::{HookBridgeConfig, HookRuntime};
 use uuid::Uuid;
 
@@ -117,6 +118,12 @@ struct PendingHookText {
     config: TextHookConfig,
 }
 
+#[derive(Clone, Debug)]
+struct HistoryEntry {
+    branch: String,
+    commit_id: CommitId,
+}
+
 struct AppModel {
     store: SessionStore,
     data_dir: PathBuf,
@@ -124,8 +131,23 @@ struct AppModel {
     branch_input: String,
     scratchpad_input: String,
     branches: String,
+    history_options: gtk::StringList,
+    history_entries: Vec<HistoryEntry>,
+    history_selection: Option<usize>,
+    history_update_in_progress: bool,
+    history_programmatic_selection: Option<u32>,
     active_game: Option<GameIdentity>,
     active_branch: String,
+    replay_paths: Vec<ReplayPath>,
+    replay_cursor: Option<ReplayCursor>,
+    resume_candidates: Vec<ResumeCandidate>,
+    replay_buffer: VecDeque<Vec<PendingHookText>>,
+    replay_started_ms: Option<i64>,
+    replay_detection_active: bool,
+    replay_session_started: bool,
+    replay_manual_override: bool,
+    retained_resume_branch: Option<String>,
+    ready_batches: VecDeque<Vec<PendingHookText>>,
     capture_streams: Vec<PortalStream>,
     capture_session: Option<WindowCaptureSession>,
     frame_receiver: Option<PortalFrameReceiver>,
@@ -187,6 +209,7 @@ enum AppMsg {
     HudFontFamilyChanged(String),
     HudFontSizeChanged(f64),
     BranchInput(String),
+    HistoryCommitSelected(u32),
     CreateBranch,
     ScratchpadInput(String),
     CommitScratchpad,
@@ -437,7 +460,22 @@ impl Component for AppModel {
                                 set_selectable: true,
                                 set_halign: gtk::Align::Start,
                                 set_valign: gtk::Align::Start,
-                                set_vexpand: true,
+                                set_wrap: true,
+                            },
+                            gtk::DropDown {
+                                set_model: Some(&model.history_options),
+                                #[watch]
+                                set_selected: model.history_selection
+                                    .map(|index| index as u32)
+                                    .unwrap_or(gtk::INVALID_LIST_POSITION),
+                                set_enable_search: true,
+                                set_hexpand: true,
+                                set_tooltip_text: Some("Select the last completed turn to replay from"),
+                                #[watch]
+                                set_sensitive: !model.history_entries.is_empty(),
+                                connect_selected_notify[sender] => move |drop_down| {
+                                    sender.input(AppMsg::HistoryCommitSelected(drop_down.selected()));
+                                },
                             },
                             gtk::Entry {
                                 set_placeholder_text: Some("New branch name"),
@@ -905,8 +943,23 @@ impl Component for AppModel {
             branch_input: String::new(),
             scratchpad_input: String::new(),
             branches: String::new(),
+            history_options: gtk::StringList::new(&["Loading history…"]),
+            history_entries: Vec::new(),
+            history_selection: None,
+            history_update_in_progress: false,
+            history_programmatic_selection: None,
             active_game: None,
             active_branch: "main".into(),
+            replay_paths: Vec::new(),
+            replay_cursor: None,
+            resume_candidates: Vec::new(),
+            replay_buffer: VecDeque::new(),
+            replay_started_ms: None,
+            replay_detection_active: false,
+            replay_session_started: false,
+            replay_manual_override: false,
+            retained_resume_branch: None,
+            ready_batches: VecDeque::new(),
             capture_streams: Vec::new(),
             capture_session: None,
             frame_receiver: None,
@@ -1089,6 +1142,14 @@ impl Component for AppModel {
                 appearance.font_size_pt = value;
             }),
             AppMsg::BranchInput(value) => self.branch_input = value,
+            AppMsg::HistoryCommitSelected(selected) => {
+                if self.history_programmatic_selection == Some(selected) {
+                    self.history_programmatic_selection = None;
+                } else if !self.history_update_in_progress {
+                    self.history_programmatic_selection = None;
+                    self.select_history_commit(selected);
+                }
+            }
             AppMsg::CreateBranch => {
                 let result = match self.active_game.as_ref() {
                     Some(game) => self
@@ -1560,6 +1621,17 @@ impl AppModel {
         }
         self.active_game = Some(game.clone());
         self.active_branch = "main".into();
+        self.replay_cursor = None;
+        self.replay_paths.clear();
+        self.resume_candidates.clear();
+        self.replay_buffer.clear();
+        self.pending_hook_text.clear();
+        self.ready_batches.clear();
+        self.replay_started_ms = None;
+        self.replay_detection_active = false;
+        self.replay_session_started = false;
+        self.replay_manual_override = false;
+        self.retained_resume_branch = None;
         self.refresh_branches();
         self.status = format!("Using per-game history for {}.", game.name);
     }
@@ -1615,6 +1687,9 @@ impl AppModel {
                 }
                 NativeTextHookEvent::Text(event) => {
                     self.activate_game(self.native_game_identity(&event.application_id));
+                    if !self.replay_session_started {
+                        self.begin_replay_detection();
+                    }
                     let hook_id = format!("native:{}:{}", event.application_id, event.object_path);
                     self.native_hook_status = format!(
                         "Hooked native text from {} ({}) at {}.",
@@ -1651,6 +1726,7 @@ impl AppModel {
             match event {
                 WineHookEvent::Connected { bridge } => {
                     self.activate_game(game_identity_from_bridge(&bridge));
+                    self.begin_replay_detection();
                     self.wine_hook_status = format!(
                         "Text hook attached to {} (PID {}, {:?}).",
                         bridge.executable.path, bridge.process_id, bridge.runtime
@@ -1757,6 +1833,11 @@ impl AppModel {
                     );
                 }
                 WineHookEvent::Disconnected { bridge } => {
+                    self.replay_session_started = false;
+                    self.replay_detection_active = false;
+                    self.replay_manual_override = false;
+                    self.replay_buffer.clear();
+                    self.replay_started_ms = None;
                     let mut unavailable = Vec::new();
                     self.hook_routes.retain(|key, routes| {
                         routes.remove(&bridge.bridge_id);
@@ -1853,6 +1934,9 @@ impl AppModel {
         if !config.enabled {
             return;
         }
+        if !self.replay_session_started && !self.replay_manual_override {
+            self.begin_replay_detection();
+        }
         pending.config = config;
         const MAX_PENDING_HOOK_TEXT: usize = 256;
         if self.pending_hook_text.len() == MAX_PENDING_HOOK_TEXT {
@@ -1861,48 +1945,148 @@ impl AppModel {
         self.pending_hook_text.push_back(pending);
     }
 
-    fn start_next_translation(&mut self, sender: &ComponentSender<Self>) {
-        if self.translation_pending || self.pending_hook_text.is_empty() {
-            return;
-        }
-        let oldest_timestamp = self
-            .pending_hook_text
-            .front()
-            .expect("queue was checked above")
-            .captured_at_ms;
-        if now_ms().saturating_sub(oldest_timestamp) < 100 {
-            return;
-        }
-        if self.model_settings.model.trim().is_empty() {
-            self.pending_hook_text.clear();
-            self.status =
-                "Selected hook text was captured, but no model is configured in the Model panel."
-                    .into();
-            return;
-        }
-        if self.model_settings.target_language.trim().is_empty() {
-            self.pending_hook_text.clear();
-            self.status =
-                "Selected hook text was captured, but the target language is blank.".into();
-            return;
-        }
+    fn begin_replay_detection(&mut self) {
+        self.replay_session_started = true;
+        self.replay_detection_active = true;
+        self.replay_manual_override = false;
+        self.replay_started_ms = Some(now_ms());
+        self.replay_buffer.clear();
+        self.resume_candidates.clear();
+        self.replay_cursor = None;
+        self.status = "Detecting a position in translation history (up to three turns)…".into();
+    }
 
-        let first_post_processors = self
-            .pending_hook_text
-            .front()
-            .expect("queue was checked above")
-            .config
-            .post_processors();
-        let first_game_id = self
-            .pending_hook_text
-            .front()
-            .and_then(|pending| pending.game.as_ref())
-            .map(|game| game.id.clone());
-        let first_timestamp = self
-            .pending_hook_text
-            .front()
-            .expect("queue was checked above")
-            .captured_at_ms;
+    fn replay_signature(batch: &[PendingHookText]) -> TurnSignature {
+        TurnSignature::from_pairs(
+            batch
+                .iter()
+                .map(|pending| (pending.hook_id.clone(), pending.text.as_str())),
+        )
+    }
+
+    fn refresh_replay_paths(&mut self) -> bool {
+        let result = match self.active_game.as_ref() {
+            Some(game) => self.store.replay_paths(&game.id),
+            None => self.store.default_replay_paths(),
+        };
+        match result {
+            Ok(paths) => {
+                self.replay_paths = paths;
+                true
+            }
+            Err(error) => {
+                self.replay_paths.clear();
+                self.status = format!("History detection unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn observe_replay_batch(&mut self, batch: Vec<PendingHookText>) {
+        self.replay_buffer.push_back(batch);
+        let observed = self
+            .replay_buffer
+            .iter()
+            .map(|batch| Self::replay_signature(batch))
+            .collect::<Vec<_>>();
+        if observed.len() > 3 || !self.refresh_replay_paths() {
+            self.finish_replay_detection(false, &[]);
+            return;
+        }
+        let game_id = self.active_game.as_ref().map(|game| &game.id);
+        let candidates =
+            match find_resume_candidates(&self.store, &self.replay_paths, &observed, game_id) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.status = format!("History detection unavailable: {error}");
+                    self.finish_replay_detection(false, &[]);
+                    return;
+                }
+            };
+        self.resume_candidates = candidates.clone();
+        self.refresh_history();
+        let timed_out = self
+            .replay_started_ms
+            .is_some_and(|started| now_ms().saturating_sub(started) >= 2_000);
+        if candidates.is_empty() {
+            // The first signature has no historical occurrence, or a later
+            // buffered signature disproved every possible window. Continue on
+            // the ordinary default branch and preserve each buffered turn.
+            self.finish_replay_detection(false, &[]);
+        } else if timed_out {
+            self.finish_replay_detection(false, &candidates);
+        } else if uniquely_identified(&candidates) {
+            self.finish_replay_detection(true, &candidates);
+        } else if observed.len() >= 3
+            || self
+                .replay_started_ms
+                .is_some_and(|started| now_ms().saturating_sub(started) >= 2_000)
+        {
+            self.finish_replay_detection(false, &candidates);
+        } else {
+            self.status = format!(
+                "History detection: {} possible positions after {} turn(s); awaiting more text…",
+                candidates.len(),
+                observed.len()
+            );
+        }
+    }
+
+    fn finish_replay_detection(&mut self, select_candidate: bool, candidates: &[ResumeCandidate]) {
+        if select_candidate {
+            if let Some(candidate) = candidates.first()
+                && let Some(mut cursor) = ReplayCursor::for_candidate(&self.replay_paths, candidate)
+            {
+                cursor.game_id = self.active_game.as_ref().map(|game| game.id.clone());
+                self.active_branch = candidate.branch.clone();
+                self.replay_cursor = Some(cursor);
+                self.status = format!(
+                    "History position detected on {} after {} matching turn(s) (confidence: unique).",
+                    candidate.branch, candidate.matched_turns
+                );
+            }
+        } else {
+            self.replay_cursor = None;
+            // Automatic detection defaults to main, except after a divergence:
+            // the durable resume branch remains the active context until the
+            // user explicitly selects another position.
+            self.active_branch = self
+                .retained_resume_branch
+                .clone()
+                .unwrap_or_else(|| "main".into());
+            if !candidates.is_empty() {
+                self.status = format!(
+                    "History detection confidence was low ({} alternatives); using {}.",
+                    candidates.len(),
+                    self.active_branch
+                );
+            } else {
+                self.status = format!(
+                    "No matching history position; using {}.",
+                    self.active_branch
+                );
+            }
+        }
+        self.replay_detection_active = false;
+        self.replay_manual_override = false;
+        self.replay_started_ms = None;
+        while let Some(batch) = self.replay_buffer.pop_front() {
+            self.ready_batches.push_back(batch);
+        }
+        self.refresh_history();
+    }
+
+    fn take_next_hook_batch(&mut self) -> Option<Vec<PendingHookText>> {
+        let first = self.pending_hook_text.front()?;
+        let oldest_timestamp = first.captured_at_ms;
+        let detection_elapsed = self
+            .replay_started_ms
+            .is_some_and(|started| now_ms().saturating_sub(started) >= 2_000);
+        if !detection_elapsed && now_ms().saturating_sub(oldest_timestamp) < 100 {
+            return None;
+        }
+        let first_post_processors = first.config.post_processors();
+        let first_game_id = first.game.as_ref().map(|game| game.id.clone());
         let queued = self.pending_hook_text.len();
         let mut batch = Vec::new();
         for _ in 0..queued {
@@ -1913,13 +2097,194 @@ impl AppModel {
             let same_game = pending.game.as_ref().map(|game| game.id.clone()) == first_game_id;
             if same_game
                 && pending.config.post_processors() == first_post_processors
-                && pending.captured_at_ms.abs_diff(first_timestamp) <= 100
+                && pending.captured_at_ms.abs_diff(oldest_timestamp) <= 100
             {
                 batch.push(pending);
             } else {
                 self.pending_hook_text.push_back(pending);
             }
         }
+        Some(batch)
+    }
+
+    fn try_replay_batch(&mut self, batch: &[PendingHookText]) -> bool {
+        let Some(mut cursor) = self.replay_cursor.take() else {
+            return false;
+        };
+        let observed = Self::replay_signature(batch);
+        let step = cursor.step(&self.store, &observed);
+        match step {
+            Ok(ReplayStep::Matched(commit)) => {
+                self.hud.set_message(&commit.translated_text);
+                self.status = format!(
+                    "Replayed stored translation from {} (no model request).",
+                    short_id(&commit.id.0)
+                );
+                if cursor.at_translatable_head() {
+                    self.active_branch = cursor.branch.clone();
+                } else {
+                    self.replay_cursor = Some(cursor);
+                }
+                self.refresh_history();
+                true
+            }
+            Ok(ReplayStep::AtHead) => {
+                self.active_branch = cursor.branch.clone();
+                self.refresh_history();
+                false
+            }
+            Ok(ReplayStep::Diverged { at }) => {
+                self.create_resume_branch(&at);
+                false
+            }
+            Ok(ReplayStep::Unavailable) | Err(_) => {
+                self.active_branch = "main".into();
+                self.status =
+                    "Stored replay payload is unavailable; continuing with a normal translation."
+                        .into();
+                false
+            }
+        }
+    }
+
+    fn create_resume_branch(&mut self, base: &CommitId) {
+        let prefix = format!("resume-{}", resume_timestamp(now_ms()));
+        let mut name = prefix.clone();
+        let existing = match self.active_game.as_ref() {
+            Some(game) => self.store.list_game_branches(&game.id),
+            None => self.store.list_branches(),
+        }
+        .unwrap_or_default();
+        let mut suffix = 2usize;
+        while existing.iter().any(|branch| branch.name == name) {
+            name = format!("{prefix}-{suffix}");
+            suffix += 1;
+        }
+        let result = match self.active_game.as_ref() {
+            Some(game) => self
+                .store
+                .create_game_branch(&game.id, &name, base, now_ms()),
+            None => self.store.create_branch(&name, base, now_ms()),
+        };
+        match result {
+            Ok(_) => {
+                self.active_branch = name.clone();
+                self.retained_resume_branch = Some(name.clone());
+                self.status = format!(
+                    "Divergence detected; created {name} at {} and translating here.",
+                    short_id(&base.0)
+                );
+            }
+            Err(error) => {
+                self.active_branch = "main".into();
+                self.retained_resume_branch = None;
+                self.status = format!("Could not create resume branch: {error}; using main.");
+            }
+        }
+        self.refresh_branches();
+    }
+
+    fn select_history_commit(&mut self, selected: u32) {
+        if selected == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        let Some(entry) = self.history_entries.get(selected as usize).cloned() else {
+            return;
+        };
+        let Some(path) = self
+            .replay_paths
+            .iter()
+            .find(|path| path.branch.name == entry.branch)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(mut cursor) = ReplayCursor::new(path, &entry.commit_id) else {
+            return;
+        };
+        if self
+            .retained_resume_branch
+            .as_ref()
+            .is_some_and(|branch| branch != &entry.branch)
+        {
+            self.retained_resume_branch = None;
+        }
+        cursor.game_id = self.active_game.as_ref().map(|game| game.id.clone());
+        self.active_branch = entry.branch.clone();
+        self.replay_cursor = Some(cursor);
+        self.replay_detection_active = false;
+        self.replay_session_started = true;
+        self.replay_manual_override = true;
+        self.replay_started_ms = None;
+        while let Some(batch) = self.replay_buffer.pop_front() {
+            self.ready_batches.push_back(batch);
+        }
+        self.status = format!(
+            "Replay cursor selected at {} on {}. Buffered turns will be re-evaluated.",
+            short_id(&entry.commit_id.0),
+            entry.branch
+        );
+        self.start_next_translation_from_queue();
+        self.refresh_history();
+    }
+
+    fn start_next_translation_from_queue(&mut self) {
+        // A manual history selection can happen outside a component update. The
+        // actual translation command is started by the next hook poll, which
+        // keeps GTK command ownership in one place.
+        self.refresh_history();
+    }
+
+    fn start_next_translation(&mut self, sender: &ComponentSender<Self>) {
+        if self.translation_pending {
+            return;
+        }
+        if self.replay_detection_active && self.pending_hook_text.is_empty() {
+            if self
+                .replay_started_ms
+                .is_some_and(|started| now_ms().saturating_sub(started) >= 2_000)
+            {
+                let candidates = self.resume_candidates.clone();
+                self.finish_replay_detection(false, &candidates);
+            } else {
+                return;
+            }
+        }
+        let batch = if let Some(batch) = self.ready_batches.pop_front() {
+            batch
+        } else {
+            let Some(batch) = self.take_next_hook_batch() else {
+                return;
+            };
+            if self.replay_detection_active {
+                self.observe_replay_batch(batch);
+                return;
+            }
+            batch
+        };
+        if batch.is_empty() {
+            return;
+        }
+        if self.try_replay_batch(&batch) {
+            self.start_next_translation(sender);
+            return;
+        }
+        if self.model_settings.model.trim().is_empty() {
+            self.ready_batches.clear();
+            self.pending_hook_text.clear();
+            self.status =
+                "Selected hook text was captured, but no model is configured in the Model panel."
+                    .into();
+            return;
+        }
+        if self.model_settings.target_language.trim().is_empty() {
+            self.ready_batches.clear();
+            self.pending_hook_text.clear();
+            self.status =
+                "Selected hook text was captured, but the target language is blank.".into();
+            return;
+        }
+
         let hook_ids = batch
             .iter()
             .map(|pending| pending.hook_id.clone())
@@ -1976,24 +2341,205 @@ impl AppModel {
     }
 
     fn refresh_branches(&mut self) {
-        let branches = match self.active_game.as_ref() {
-            Some(game) => self.store.list_game_branches(&game.id),
-            None => self.store.list_branches(),
+        self.refresh_history();
+    }
+
+    fn refresh_history(&mut self) {
+        let paths = match self.active_game.as_ref() {
+            Some(game) => self.store.replay_paths(&game.id),
+            None => self.store.default_replay_paths(),
         };
-        self.branches = match branches {
-            Ok(branches) => branches
+        let paths = match paths {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.replay_paths.clear();
+                self.resume_candidates.clear();
+                self.history_entries.clear();
+                self.history_selection = None;
+                self.history_update_in_progress = true;
+                self.history_options.splice(
+                    0,
+                    self.history_options.n_items(),
+                    &["History unavailable"],
+                );
+                self.history_update_in_progress = false;
+                self.history_programmatic_selection = None;
+                self.branches = format!("History unavailable: {error}");
+                return;
+            }
+        };
+        self.replay_paths = paths.clone();
+
+        let mut branch_lines = Vec::new();
+        for path in &paths {
+            let marker = if path.branch.name == self.active_branch {
+                "●"
+            } else {
+                "○"
+            };
+            branch_lines.push(format!(
+                "{marker} {}  head {}  ({})",
+                path.branch.name,
+                short_id(&path.branch.head.0),
+                format_timestamp(path.branch.updated_at_ms)
+            ));
+        }
+
+        struct BrowserCommit {
+            entry: HistoryEntry,
+            commit: TranslationCommit,
+            heads: Vec<String>,
+        }
+        let mut by_id = std::collections::BTreeMap::<String, BrowserCommit>::new();
+        for path in &paths {
+            for commit in &path.commits {
+                let id = commit.id.0.clone();
+                let is_preferred = path.branch.name == "main";
+                match by_id.get_mut(&id) {
+                    Some(existing) => {
+                        if path.branch.head == commit.id
+                            && !existing.heads.contains(&path.branch.name)
+                        {
+                            existing.heads.push(path.branch.name.clone());
+                        }
+                        if is_preferred
+                            || (existing.entry.branch != "main"
+                                && path.branch.name < existing.entry.branch)
+                        {
+                            existing.entry.branch = path.branch.name.clone();
+                        }
+                    }
+                    None => {
+                        by_id.insert(
+                            id,
+                            BrowserCommit {
+                                entry: HistoryEntry {
+                                    branch: path.branch.name.clone(),
+                                    commit_id: commit.id.clone(),
+                                },
+                                commit: commit.clone(),
+                                heads: if path.branch.head == commit.id {
+                                    vec![path.branch.name.clone()]
+                                } else {
+                                    Vec::new()
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let current_id = if let Some(cursor) = &self.replay_cursor {
+            Some(cursor.current_commit_id())
+        } else {
+            match self.active_game.as_ref() {
+                Some(game) => self
+                    .store
+                    .game_branch(&game.id, &self.active_branch)
+                    .ok()
+                    .map(|branch| branch.head),
+                None => self
+                    .store
+                    .branch(&self.active_branch)
+                    .ok()
+                    .map(|branch| branch.head),
+            }
+        };
+        let mut browser_commits = by_id.into_values().collect::<Vec<_>>();
+        browser_commits.sort_by(|left, right| {
+            right
+                .commit
+                .created_at_ms
+                .cmp(&left.commit.created_at_ms)
+                .then_with(|| left.commit.id.0.cmp(&right.commit.id.0))
+        });
+        let mut entries = Vec::with_capacity(browser_commits.len());
+        let mut labels = Vec::with_capacity(browser_commits.len());
+        for browser in browser_commits {
+            let current = current_id.as_ref() == Some(&browser.commit.id);
+            let head = !browser.heads.is_empty();
+            let mut markers = Vec::new();
+            if current {
+                markers.push("current");
+            }
+            if head {
+                markers.push("head");
+            }
+            let marker_text = if markers.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", markers.join(", "))
+            };
+            let heads = if browser.heads.is_empty() {
+                String::new()
+            } else {
+                format!(" ← {}", browser.heads.join(", "))
+            };
+            labels.push(format!(
+                "{}  {}  {}{}{} — {}",
+                browser.entry.branch,
+                format_timestamp(browser.commit.created_at_ms),
+                short_id(&browser.commit.id.0),
+                marker_text,
+                heads,
+                one_line_preview(&browser.commit.source_text)
+            ));
+            entries.push(browser.entry);
+        }
+        let desired_id = self
+            .replay_cursor
+            .as_ref()
+            .map(ReplayCursor::current_commit_id)
+            .or_else(|| current_id.clone());
+        let selection = desired_id
+            .as_ref()
+            .and_then(|id| entries.iter().position(|entry| &entry.commit_id == id))
+            .or_else(|| entries.first().map(|_| 0));
+        self.history_update_in_progress = true;
+        self.history_options.splice(
+            0,
+            self.history_options.n_items(),
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        self.history_update_in_progress = false;
+        self.history_entries = entries;
+        self.history_selection = selection;
+        self.history_programmatic_selection = selection.map(|index| index as u32);
+        let detection = if self.replay_detection_active {
+            "\nReplay detection: buffering initial turns (up to 3 or 2 seconds).".to_owned()
+        } else if self.replay_cursor.is_some() {
+            if self.resume_candidates.is_empty() {
+                "\nReplay cursor: manually selected.".to_owned()
+            } else {
+                "\nReplay detection: high-confidence position selected.".to_owned()
+            }
+        } else {
+            String::new()
+        };
+        let alternatives = if self.resume_candidates.len() > 1 {
+            let ranked = self
+                .resume_candidates
                 .iter()
-                .map(|branch| {
-                    let marker = if branch.name == self.active_branch {
-                        "●"
-                    } else {
-                        "○"
-                    };
-                    format!("{marker} {}  {}", branch.name, short_id(&branch.head.0))
+                .take(5)
+                .enumerate()
+                .map(|(index, candidate)| {
+                    format!(
+                        "\n  {}. {} at {} ({} turn match)",
+                        index + 1,
+                        candidate.branch,
+                        short_id(&candidate.commit_id.0),
+                        candidate.matched_turns
+                    )
                 })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Err(error) => format!("History unavailable: {error}"),
+                .collect::<String>();
+            format!("\nRanked alternatives:{ranked}")
+        } else {
+            String::new()
+        };
+        self.branches = if branch_lines.is_empty() {
+            format!("No named branches.{detection}{alternatives}")
+        } else {
+            format!("{}{}{}", branch_lines.join("\n"), detection, alternatives)
         };
     }
 
@@ -2063,6 +2609,49 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn one_line_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = one_line.chars();
+    let preview = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        format!("{preview}…")
+    } else if preview.is_empty() {
+        "(structural commit)".into()
+    } else {
+        preview
+    }
+}
+
+fn format_timestamp(timestamp_ms: i64) -> String {
+    if timestamp_ms <= 0 {
+        return "unknown time".into();
+    }
+    resume_timestamp(timestamp_ms)
+}
+
+fn resume_timestamp(timestamp_ms: i64) -> String {
+    let seconds = timestamp_ms.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds / 60 % 60;
+    let second = day_seconds % 60;
+
+    // Civil date from days since 1970-01-01 (proleptic Gregorian calendar).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
 }
 
 fn short_id(id: &str) -> &str {
@@ -2231,9 +2820,7 @@ fn wine_target_option_label(target: &WineTarget) -> String {
 }
 
 fn native_application_option_label(application: &NativeApplication) -> String {
-    if application.name.trim().is_empty() {
-        application.id.clone()
-    } else if application.name == application.id {
+    if application.name.trim().is_empty() || application.name == application.id {
         application.id.clone()
     } else {
         format!("{} — {}", application.name, application.id)
