@@ -208,6 +208,10 @@ pub enum BridgeMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookBridgeConfig {
     pub socket_path: String,
+    /// Authenticated loopback listener used by Wine clients, whose Winsock
+    /// implementation does not reliably provide `AF_UNIX`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_port: Option<u16>,
     pub authentication_token_hex: String,
 }
 
@@ -357,6 +361,7 @@ mod tests {
     fn config_rejects_malformed_tokens() {
         let config = HookBridgeConfig {
             socket_path: "/tmp/hook.sock".into(),
+            tcp_port: None,
             authentication_token_hex: "zz".repeat(AUTHENTICATION_TOKEN_BYTES),
         };
         assert_eq!(
@@ -365,6 +370,7 @@ mod tests {
         );
         let unicode = HookBridgeConfig {
             socket_path: "/tmp/hook.sock".into(),
+            tcp_port: None,
             authentication_token_hex: format!("é{}", "0".repeat(62)),
         };
         assert_eq!(

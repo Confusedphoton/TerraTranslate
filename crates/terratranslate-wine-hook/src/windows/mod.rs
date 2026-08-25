@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -13,10 +15,6 @@ use terratranslate_wine_protocol::{
 };
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{FILETIME, HINSTANCE, TRUE};
-use windows_sys::Win32::Networking::WinSock::{
-    AF_UNIX, FIONBIO, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKET, WSADATA, WSAEWOULDBLOCK,
-    WSAGetLastError, WSAStartup, closesocket, connect, ioctlsocket, recv, send, socket,
-};
 use windows_sys::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetModuleFileNameW};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
@@ -26,12 +24,12 @@ use crate::{CandidateBook, Observation, bounded_utf8};
 
 mod directwrite;
 mod gdi;
+mod harfbuzz;
 mod uniscribe;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_WIRE_MESSAGE: usize = 1024 * 1024;
-const UNIX_PATH_CAPACITY: usize = 108;
 
 static OBSERVATIONS: OnceLock<Mutex<Option<SyncSender<Observation>>>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -124,7 +122,7 @@ fn worker_main(config_path: PathBuf) {
             std::thread::sleep(Duration::from_millis(500));
             continue;
         };
-        match UnixSocket::connect(&config.socket_path) {
+        match BridgeSocket::connect(&config) {
             Ok(mut stream) => {
                 let hello = BridgeMessage::Hello(BridgeHello {
                     protocol_version: PROTOCOL_VERSION,
@@ -139,7 +137,12 @@ fn worker_main(config_path: PathBuf) {
                         ProcessArchitecture::X86_64
                     },
                     executable: executable.clone(),
-                    adapters: vec!["gdi".into(), "uniscribe".into(), "directwrite".into()],
+                    adapters: vec![
+                        "gdi".into(),
+                        "uniscribe".into(),
+                        "directwrite".into(),
+                        "harfbuzz".into(),
+                    ],
                 });
                 if stream.write_message(&hello).is_ok() {
                     book.reset_connection();
@@ -175,6 +178,7 @@ fn install_hooks() -> bool {
             gdi::install();
             uniscribe::install();
             directwrite::install();
+            harfbuzz::install();
         }
         MinHook::enable_all_hooks()
     });
@@ -198,7 +202,7 @@ fn reset_worker_state() {
 }
 
 fn service_connection(
-    stream: &mut UnixSocket,
+    stream: &mut BridgeSocket,
     receiver: &Receiver<Observation>,
     book: &mut CandidateBook,
 ) {
@@ -358,56 +362,18 @@ unsafe fn copy_nul_terminated(pointer: *const u16, maximum: usize) -> Option<Str
     }))
 }
 
-#[repr(C)]
-struct SockAddrUn {
-    family: u16,
-    path: [i8; UNIX_PATH_CAPACITY],
-}
-
-struct UnixSocket {
-    socket: SOCKET,
+struct BridgeSocket {
+    stream: TcpStream,
     input: Vec<u8>,
 }
 
-impl UnixSocket {
-    fn connect(path: &str) -> Result<Self, ()> {
-        let bytes = path.as_bytes();
-        if bytes.is_empty() || bytes.len() >= UNIX_PATH_CAPACITY {
-            return Err(());
-        }
-        let mut data = WSADATA::default();
-        if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
-            return Err(());
-        }
-        let handle = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
-        if handle == INVALID_SOCKET {
-            return Err(());
-        }
-        let mut address = SockAddrUn {
-            family: AF_UNIX,
-            path: [0; UNIX_PATH_CAPACITY],
-        };
-        for (target, source) in address.path.iter_mut().zip(bytes) {
-            *target = *source as i8;
-        }
-        let result = unsafe {
-            connect(
-                handle,
-                (&raw const address).cast::<SOCKADDR>(),
-                (std::mem::size_of::<u16>() + bytes.len() + 1) as i32,
-            )
-        };
-        if result != 0 {
-            unsafe { closesocket(handle) };
-            return Err(());
-        }
-        let mut nonblocking = 1;
-        if unsafe { ioctlsocket(handle, FIONBIO, &mut nonblocking) } != 0 {
-            unsafe { closesocket(handle) };
-            return Err(());
-        }
+impl BridgeSocket {
+    fn connect(config: &HookBridgeConfig) -> Result<Self, ()> {
+        let port = config.tcp_port.ok_or(())?;
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).map_err(|_| ())?;
+        stream.set_nonblocking(true).map_err(|_| ())?;
         Ok(Self {
-            socket: handle,
+            stream,
             input: Vec::with_capacity(4096),
         })
     }
@@ -422,20 +388,13 @@ impl UnixSocket {
         bytes.extend_from_slice(&payload);
         let mut sent = 0;
         while sent < bytes.len() {
-            let result = unsafe {
-                send(
-                    self.socket,
-                    bytes[sent..].as_ptr(),
-                    (bytes.len() - sent) as i32,
-                    0,
-                )
-            };
-            if result > 0 {
-                sent += result as usize;
-            } else if unsafe { WSAGetLastError() } == WSAEWOULDBLOCK {
-                std::thread::sleep(Duration::from_millis(1));
-            } else {
-                return Err(());
+            match self.stream.write(&bytes[sent..]) {
+                Ok(0) => return Err(()),
+                Ok(written) => sent += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err(()),
             }
         }
         Ok(())
@@ -444,18 +403,16 @@ impl UnixSocket {
     fn read_message<T: for<'de> serde::Deserialize<'de>>(&mut self) -> Result<Option<T>, ()> {
         let mut buffer = [0_u8; 4096];
         loop {
-            let result = unsafe { recv(self.socket, buffer.as_mut_ptr(), buffer.len() as i32, 0) };
-            if result > 0 {
-                self.input.extend_from_slice(&buffer[..result as usize]);
-                if self.input.len() > MAX_WIRE_MESSAGE + 4 {
-                    return Err(());
+            match self.stream.read(&mut buffer) {
+                Ok(0) => return Err(()),
+                Ok(read) => {
+                    self.input.extend_from_slice(&buffer[..read]);
+                    if self.input.len() > MAX_WIRE_MESSAGE + 4 {
+                        return Err(());
+                    }
                 }
-            } else if result == 0 {
-                return Err(());
-            } else if unsafe { WSAGetLastError() } == WSAEWOULDBLOCK {
-                break;
-            } else {
-                return Err(());
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err(()),
             }
         }
         if self.input.len() < 4 {
@@ -471,11 +428,5 @@ impl UnixSocket {
         let message = decode(&self.input[4..length + 4], MAX_WIRE_MESSAGE).map_err(|_| ())?;
         self.input.drain(..length + 4);
         Ok(Some(message))
-    }
-}
-
-impl Drop for UnixSocket {
-    fn drop(&mut self) {
-        unsafe { closesocket(self.socket) };
     }
 }

@@ -164,7 +164,7 @@ struct AppModel {
     text_hooks: relm4::factory::FactoryVecDeque<TextHookRow>,
     text_hook_configs: BTreeMap<String, TextHookConfig>,
     text_hook_indices: BTreeMap<String, usize>,
-    hook_routes: BTreeMap<String, (Uuid, Uuid)>,
+    hook_routes: BTreeMap<String, BTreeMap<Uuid, Uuid>>,
     text_hook_configs_path: PathBuf,
     pending_hook_text: VecDeque<PendingHookText>,
     translation_pending: bool,
@@ -1195,7 +1195,7 @@ impl Component for AppModel {
                 let bridges = self
                     .hook_routes
                     .values()
-                    .map(|(bridge_id, _)| *bridge_id)
+                    .flat_map(|routes| routes.keys().copied())
                     .collect::<std::collections::BTreeSet<_>>();
                 for bridge_id in bridges {
                     let _ = self.wine_hook_service.shutdown(bridge_id);
@@ -1284,16 +1284,18 @@ impl Component for AppModel {
                 }
             }
             AppMsg::TextHookConfigChanged(id, config) => {
-                if let Some((bridge_id, candidate_id)) = self.hook_routes.get(&id).copied() {
-                    let control = if config.enabled {
-                        self.wine_hook_service
-                            .enable_candidate(bridge_id, candidate_id)
-                    } else {
-                        self.wine_hook_service
-                            .disable_candidate(bridge_id, candidate_id)
-                    };
-                    if let Err(error) = control {
-                        self.status = format!("Could not update hook producer: {error}");
+                if let Some(routes) = self.hook_routes.get(&id) {
+                    for (&bridge_id, &candidate_id) in routes {
+                        let control = if config.enabled {
+                            self.wine_hook_service
+                                .enable_candidate(bridge_id, candidate_id)
+                        } else {
+                            self.wine_hook_service
+                                .disable_candidate(bridge_id, candidate_id)
+                        };
+                        if let Err(error) = control {
+                            self.status = format!("Could not update hook producer: {error}");
+                        }
                     }
                 }
                 self.text_hook_configs.insert(id, config);
@@ -1306,10 +1308,12 @@ impl Component for AppModel {
                 }
             }
             AppMsg::ForgetTextHook(id) => {
-                if let Some((bridge_id, candidate_id)) = self.hook_routes.remove(&id) {
-                    let _ = self
-                        .wine_hook_service
-                        .disable_candidate(bridge_id, candidate_id);
+                if let Some(routes) = self.hook_routes.remove(&id) {
+                    for (bridge_id, candidate_id) in routes {
+                        let _ = self
+                            .wine_hook_service
+                            .disable_candidate(bridge_id, candidate_id);
+                    }
                 }
                 self.text_hook_configs.remove(&id);
                 if let Some(index) = self.text_hook_indices.remove(&id) {
@@ -1664,7 +1668,9 @@ impl AppModel {
                         (None, None) => "unknown caller".into(),
                     };
                     self.hook_routes
-                        .insert(hook_id.clone(), (bridge.bridge_id, candidate.candidate_id));
+                        .entry(hook_id.clone())
+                        .or_default()
+                        .insert(bridge.bridge_id, candidate.candidate_id);
                     self.observe_text_hook(
                         hook_id.clone(),
                         format!("{} — {}", executable, candidate.adapter_id),
@@ -1692,8 +1698,11 @@ impl AppModel {
                 WineHookEvent::Text { bridge, event } => {
                     self.activate_game(game_identity_from_bridge(&bridge));
                     let hook_id = event.stable_key.to_string();
-                    if self.hook_routes.get(&hook_id)
-                        != Some(&(bridge.bridge_id, event.candidate_id))
+                    if self
+                        .hook_routes
+                        .get(&hook_id)
+                        .and_then(|routes| routes.get(&bridge.bridge_id))
+                        != Some(&event.candidate_id)
                     {
                         continue;
                     }
@@ -1748,14 +1757,17 @@ impl AppModel {
                     );
                 }
                 WineHookEvent::Disconnected { bridge } => {
-                    let disconnected = self
-                        .hook_routes
-                        .iter()
-                        .filter(|(_, (bridge_id, _))| *bridge_id == bridge.bridge_id)
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>();
-                    for key in disconnected {
-                        self.hook_routes.remove(&key);
+                    let mut unavailable = Vec::new();
+                    self.hook_routes.retain(|key, routes| {
+                        routes.remove(&bridge.bridge_id);
+                        if routes.is_empty() {
+                            unavailable.push(key.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for key in unavailable {
                         if let Some(index) = self.text_hook_indices.get(&key).copied() {
                             self.text_hooks
                                 .guard()
@@ -2221,8 +2233,10 @@ fn wine_target_option_label(target: &WineTarget) -> String {
 fn native_application_option_label(application: &NativeApplication) -> String {
     if application.name.trim().is_empty() {
         application.id.clone()
+    } else if application.name == application.id {
+        application.id.clone()
     } else {
-        application.name.clone()
+        format!("{} — {}", application.name, application.id)
     }
 }
 
@@ -2260,6 +2274,7 @@ fn start_wine_hook(data_dir: &Path) -> Result<(WineHookService, PathBuf)> {
     let socket_path_string = service.socket_path().display().to_string();
     let config = HookBridgeConfig {
         socket_path: socket_path_string,
+        tcp_port: Some(service.tcp_port()),
         authentication_token_hex: authentication_token
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -2363,7 +2378,14 @@ fn main() -> Result<()> {
     };
     let native_preload_path = native_preload_library_path();
     let wine_artifacts = WineArtifacts::host_defaults();
-    let app = RelmApp::new("io.github.confusedphoton.TerraTranslate");
+    // clap has already consumed TerraTranslate's command-line options.  Do not
+    // pass them to GApplication a second time: GTK only understands its own
+    // options and would otherwise reject valid flags such as `--data-dir`.
+    let app = RelmApp::new("io.github.confusedphoton.TerraTranslate").with_args(vec![
+        env::args()
+            .next()
+            .unwrap_or_else(|| "terratranslate".into()),
+    ]);
     app.run::<AppModel>(AppInit {
         store,
         data_dir,
@@ -2437,5 +2459,20 @@ mod wine_hook_startup_tests {
             ["--name", "two words", "literal $HOME", ""]
         );
         assert!(parse_native_arguments("'unterminated").is_err());
+    }
+
+    #[test]
+    fn native_application_options_disambiguate_duplicate_names() {
+        let first = NativeApplication {
+            id: ":1.10".into(),
+            name: "Example".into(),
+        };
+        let second = NativeApplication {
+            id: ":1.11".into(),
+            name: "Example".into(),
+        };
+
+        assert_eq!(native_application_option_label(&first), "Example — :1.10");
+        assert_eq!(native_application_option_label(&second), "Example — :1.11");
     }
 }

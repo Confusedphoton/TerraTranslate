@@ -6,8 +6,9 @@
 
 use std::sync::{Arc, RwLock, mpsc};
 
-use atspi::AccessibilityConnection;
 use atspi::events::object::TextChangedEvent;
+use atspi::proxy::accessible::ObjectRefExt;
+use atspi_connection::AccessibilityConnection;
 use futures_util::{StreamExt, pin_mut};
 
 #[derive(Debug, thiserror::Error)]
@@ -19,9 +20,6 @@ pub struct NativeApplication {
     pub id: String,
     pub name: String,
 }
-
-const ATSPI_REGISTRY_SERVICE: &str = "org.a11y.atspi.Registry";
-const ATSPI_ACCESSIBLE_ROOT: &str = "/org/a11y/atspi/accessible/root";
 
 fn is_atspi_service_unavailable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -41,14 +39,9 @@ pub async fn list_native_applications() -> Result<Vec<NativeApplication>, Native
             return Err(NativeAccessibilityError(error));
         }
     };
-    let root = match atspi::proxy::accessible::AccessibleProxy::builder(connection.connection())
-        .destination(ATSPI_REGISTRY_SERVICE)
-        .map_err(|error| NativeAccessibilityError(error.to_string()))?
-        .path(ATSPI_ACCESSIBLE_ROOT)
-        .map_err(|error| NativeAccessibilityError(error.to_string()))?
-        .build()
-        .await
-    {
+    // The registry's Accessible implementation is intentionally incomplete.
+    // This helper disables zbus property caching, unlike a default proxy builder.
+    let root = match connection.root_accessible_on_registry().await {
         Ok(root) => root,
         Err(error) if is_atspi_service_unavailable(&error.to_string()) => return Ok(Vec::new()),
         Err(error) => return Err(NativeAccessibilityError(error.to_string())),
@@ -63,28 +56,34 @@ pub async fn list_native_applications() -> Result<Vec<NativeApplication>, Native
         let Some(id) = child.name_as_str() else {
             continue;
         };
-        let proxy =
-            match atspi::proxy::accessible::AccessibleProxy::builder(connection.connection())
-                .destination(id)
-                .map_err(|error| NativeAccessibilityError(error.to_string()))?
-                .path(child.path_as_str())
-                .map_err(|error| NativeAccessibilityError(error.to_string()))?
-                .build()
-                .await
-            {
-                Ok(proxy) => proxy,
-                // Applications can disappear between GetChildren and proxy creation.
-                Err(error) if is_atspi_service_unavailable(&error.to_string()) => continue,
-                Err(error) => return Err(NativeAccessibilityError(error.to_string())),
-            };
-        let name = proxy.name().await.unwrap_or_else(|_| id.to_owned());
+
+        // Registry children are the authoritative application snapshot. Some
+        // toolkits expose only part of Accessible, and applications can vanish
+        // while metadata is queried. Neither condition should hide the other
+        // healthy applications (or poison the entire refresh).
+        let name = match child.as_accessible_proxy(connection.connection()).await {
+            Ok(proxy) => proxy.name().await.unwrap_or_else(|_| id.to_owned()),
+            Err(_) => id.to_owned(),
+        };
         applications.push(NativeApplication {
             id: id.to_owned(),
             name,
         });
     }
-    applications.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    normalize_native_applications(&mut applications);
     Ok(applications)
+}
+
+fn normalize_native_applications(applications: &mut Vec<NativeApplication>) {
+    applications.sort_by(|left, right| left.id.cmp(&right.id));
+    applications.dedup_by(|left, right| left.id == right.id);
+    applications.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then(left.name.cmp(&right.name))
+            .then(left.id.cmp(&right.id))
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +209,7 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_atspi_service_unavailable;
+    use super::{NativeApplication, is_atspi_service_unavailable, normalize_native_applications};
 
     #[test]
     fn recognizes_missing_or_unactivatable_atspi_service() {
@@ -228,5 +227,51 @@ mod tests {
         assert!(!is_atspi_service_unavailable(
             "org.freedesktop.DBus.Error.AccessDenied: denied"
         ));
+    }
+
+    #[test]
+    fn preserves_distinct_applications_with_duplicate_names() {
+        let mut applications = vec![
+            NativeApplication {
+                id: ":1.9".into(),
+                name: "Game".into(),
+            },
+            NativeApplication {
+                id: ":1.4".into(),
+                name: "game".into(),
+            },
+            NativeApplication {
+                id: ":1.3".into(),
+                name: "Game".into(),
+            },
+        ];
+
+        normalize_native_applications(&mut applications);
+
+        assert_eq!(
+            applications
+                .iter()
+                .map(|application| application.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![":1.3", ":1.9", ":1.4"]
+        );
+    }
+
+    #[test]
+    fn removes_duplicate_registry_references_by_application_id() {
+        let mut applications = vec![
+            NativeApplication {
+                id: ":1.7".into(),
+                name: ":1.7".into(),
+            },
+            NativeApplication {
+                id: ":1.7".into(),
+                name: "Example".into(),
+            },
+        ];
+
+        normalize_native_applications(&mut applications);
+
+        assert_eq!(applications.len(), 1);
     }
 }

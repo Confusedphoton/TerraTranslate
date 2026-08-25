@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use minhook::MinHook;
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::HDC;
+use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
 use crate::bounded_utf16;
 
@@ -69,6 +70,13 @@ static ASSOCIATIONS: OnceLock<Mutex<BTreeMap<usize, String>>> = OnceLock::new();
 const MAX_ASSOCIATIONS: usize = 256;
 
 pub(super) unsafe fn install() {
+    let module = "usp10.dll"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe { LoadLibraryW(module.as_ptr()) }.is_null() {
+        return;
+    }
     unsafe {
         hook(
             "ScriptStringAnalyse",

@@ -102,6 +102,7 @@ pub fn write_native_hook_config(
         .ok_or_else(|| NativeLaunchError::NonUtf8Config(socket_path.to_owned()))?;
     let config = HookBridgeConfig {
         socket_path: socket_path.into(),
+        tcp_port: None,
         authentication_token_hex: authentication_token
             .iter()
             .map(|byte| format!("{byte:02x}"))

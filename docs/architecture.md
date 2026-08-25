@@ -28,12 +28,15 @@ If the branch moves during inference, the commit remains preserved but is not ch
   requests.
 - `terratranslate-engine`: end-to-end versioned translation turns.
 - `terratranslate-platform-linux`: desktop capability detection, portals, native launcher, Wine
-  process discovery, and the authenticated platform-neutral Unix-socket hook host.
+  process discovery, and the authenticated hook host. Native clients use a Unix socket; Wine
+  clients use an ephemeral loopback TCP listener because Winsock under Wine lacks reliable
+  `AF_UNIX` support.
 - `terratranslate-plugin-api` and `terratranslate-plugin-runner`: versioned native processor ABI
   and out-of-process execution.
 - `terratranslate-wine-protocol`, `terratranslate-wine-hook`, and
   `terratranslate-wine-injector`: shared hook messages, GDI/Uniscribe/DirectWrite interception,
-  and architecture-checked same-prefix DLL injection.
+  module-agnostic HarfBuzz interception for custom GPU renderers, and architecture-checked
+  same-prefix DLL injection.
 - `terratranslate-native-hook`: launch-time Pango, SDL_ttf 2/3, and Cairo interception.
 - `terratranslate-app`: GTK4/Relm4 control surface and diagnostics CLI.
 

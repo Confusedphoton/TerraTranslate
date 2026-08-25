@@ -27,7 +27,12 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-atspi = { version = "0.30", features = ["tokio"] }
+# AT-SPI's optional P2P bootstrap is all-or-nothing: one registry child that
+# omits the Accessible or Application interface prevents the connection from
+# being created. TerraTranslate consumes registry-bus events directly, so keep
+# the required connection/proxy/event features without that fragile bootstrap.
+atspi = { version = "0.30", default-features = false, features = ["proxies", "tokio", "wrappers"] }
+atspi-connection = { version = "0.14", default-features = false, features = ["wrappers"] }
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "global_shortcuts", "pipewire"] }
 base64 = "0.22"
 blake3 = "1.8"

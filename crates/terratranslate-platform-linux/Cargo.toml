@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 ashpd.workspace = true
 atspi.workspace = true
+atspi-connection.workspace = true
 futures-util.workspace = true
 pipewire.workspace = true
 png.workspace = true

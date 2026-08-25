@@ -10,6 +10,7 @@ use windows_sys::Win32::Globalization::{
 use windows_sys::Win32::Graphics::Gdi::{
     DRAWTEXTPARAMS, ETO_GLYPH_INDEX, HDC, POLYTEXTA, POLYTEXTW,
 };
+use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 use windows_sys::core::BOOL;
 
 use crate::{MAX_TEXT_UTF16, bounded_utf16};
@@ -43,6 +44,12 @@ static POLY_TEXT_OUT_W: OnceLock<usize> = OnceLock::new();
 static POLY_TEXT_OUT_A: OnceLock<usize> = OnceLock::new();
 
 pub(super) unsafe fn install() {
+    // MinHook's create_hook_api only searches already-loaded modules.  Load the
+    // system text libraries on the worker thread before registering detours.
+    for module in ["gdi32.dll", "user32.dll"] {
+        let wide = module.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let _ = unsafe { LoadLibraryW(wide.as_ptr()) };
+    }
     unsafe {
         hook("gdi32.dll", "TextOutW", text_out_w as _, &TEXT_OUT_W);
         hook("gdi32.dll", "TextOutA", text_out_a as _, &TEXT_OUT_A);

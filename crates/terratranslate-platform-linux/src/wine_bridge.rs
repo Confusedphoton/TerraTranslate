@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use terratranslate_wine_protocol::{
     ProcessArchitecture, StableCandidateKey, decode, encode,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc as tokio_mpsc;
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -95,13 +96,75 @@ impl HookBridgeServer {
             },
         )
         .await?;
-        Ok(HookBridgeConnection { stream, hello })
+        Ok(HookBridgeConnection {
+            stream: HookBridgeStream::Unix(stream),
+            hello,
+        })
     }
 }
 
+async fn accept_tcp(
+    listener: &TcpListener,
+    authentication_token: [u8; 32],
+) -> Result<HookBridgeConnection, BridgeServerError> {
+    let (mut stream, peer) = listener.accept().await?;
+    if !peer.ip().is_loopback() {
+        return Err(BridgeServerError::InvalidMessage(
+            "Wine hook TCP client is not local",
+        ));
+    }
+    let first_message = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_message::<BridgeMessage>(&mut stream),
+    )
+    .await
+    .map_err(|_| BridgeServerError::HandshakeTimeout)??;
+    let hello = match first_message {
+        BridgeMessage::Hello(hello) => hello,
+        _ => return Err(BridgeServerError::MissingHello),
+    };
+    if !tokens_equal(&hello.authentication_token, &authentication_token) {
+        let _ = write_message(
+            &mut stream,
+            &HostMessage::Reject {
+                reason: "authentication failed".into(),
+            },
+        )
+        .await;
+        return Err(BridgeServerError::Authentication);
+    }
+    if hello.protocol_version != PROTOCOL_VERSION {
+        let _ = write_message(
+            &mut stream,
+            &HostMessage::Reject {
+                reason: format!("protocol {} is unsupported", hello.protocol_version),
+            },
+        )
+        .await;
+        return Err(BridgeServerError::Version(hello.protocol_version));
+    }
+    validate_hello(&hello)?;
+    write_message(
+        &mut stream,
+        &HostMessage::Accept {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+    Ok(HookBridgeConnection {
+        stream: HookBridgeStream::Tcp(stream),
+        hello,
+    })
+}
+
 pub struct HookBridgeConnection {
-    stream: UnixStream,
+    stream: HookBridgeStream,
     hello: BridgeHello,
+}
+
+enum HookBridgeStream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
 }
 
 impl HookBridgeConnection {
@@ -110,13 +173,19 @@ impl HookBridgeConnection {
     }
 
     pub async fn receive(&mut self) -> Result<BridgeMessage, BridgeServerError> {
-        let message = read_message(&mut self.stream).await?;
+        let message = match &mut self.stream {
+            HookBridgeStream::Unix(stream) => read_message(stream).await?,
+            HookBridgeStream::Tcp(stream) => read_message(stream).await?,
+        };
         validate_bridge_message(&message)?;
         Ok(message)
     }
 
     pub async fn send(&mut self, message: &HostMessage) -> Result<(), BridgeServerError> {
-        write_message(&mut self.stream, message).await
+        match &mut self.stream {
+            HookBridgeStream::Unix(stream) => write_message(stream, message).await,
+            HookBridgeStream::Tcp(stream) => write_message(stream, message).await,
+        }
     }
 }
 
@@ -187,6 +256,7 @@ pub enum HookControlError {
 pub struct HookService {
     events: Receiver<HookEvent>,
     socket_path: PathBuf,
+    tcp_port: u16,
     connections: ConnectionRegistry,
     stopping: Arc<AtomicBool>,
 }
@@ -215,6 +285,9 @@ impl HookService {
         let socket_path = path.into();
         let listener = StdUnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
+        let tcp_listener = StdTcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        tcp_listener.set_nonblocking(true)?;
+        let tcp_port = tcp_listener.local_addr()?.port();
         let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let connections = Arc::new(Mutex::new(HashMap::new()));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -226,6 +299,7 @@ impl HookService {
                 move || {
                     run_hook_server(
                         listener,
+                        tcp_listener,
                         authentication_token,
                         events_tx,
                         connections,
@@ -237,6 +311,7 @@ impl HookService {
         Ok(Self {
             events,
             socket_path,
+            tcp_port,
             connections,
             stopping,
         })
@@ -244,6 +319,10 @@ impl HookService {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn tcp_port(&self) -> u16 {
+        self.tcp_port
     }
 
     pub fn try_recv(&self) -> Result<HookEvent, mpsc::TryRecvError> {
@@ -342,12 +421,14 @@ impl Drop for HookService {
         }
         // Wake the blocking async accept so the server thread can observe `stopping`.
         let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+        let _ = StdTcpStream::connect((std::net::Ipv4Addr::LOCALHOST, self.tcp_port));
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
 fn run_hook_server(
     listener: StdUnixListener,
+    tcp_listener: StdTcpListener,
     authentication_token: [u8; 32],
     events: SyncSender<HookEvent>,
     connections: ConnectionRegistry,
@@ -378,12 +459,28 @@ fn run_hook_server(
                 return;
             }
         };
+        let tcp_listener = match TcpListener::from_std(tcp_listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                send_event(
+                    &events,
+                    HookEvent::Error(format!(
+                        "register Wine hook TCP socket with runtime: {error}"
+                    )),
+                );
+                return;
+            }
+        };
         let server = HookBridgeServer {
             listener,
             authentication_token,
         };
         while !stopping.load(Ordering::Acquire) {
-            match server.accept().await {
+            let accepted = tokio::select! {
+                connection = server.accept() => connection,
+                connection = accept_tcp(&tcp_listener, authentication_token) => connection,
+            };
+            match accepted {
                 Ok(connection) => {
                     let events = events.clone();
                     let connections = Arc::clone(&connections);
@@ -545,8 +642,16 @@ async fn receive_hook_events(
 }
 
 fn send_event(events: &SyncSender<HookEvent>, event: HookEvent) {
-    // Discovery and text are observational. A slow GUI must not backpressure hook clients.
-    let _ = events.try_send(event);
+    if matches!(&event, HookEvent::Candidate { .. }) {
+        // A producer advertises each candidate only once per connection.  Losing
+        // this event would make the hook permanently undiscoverable, so apply
+        // bounded backpressure until the GUI drains the discovery queue.
+        let _ = events.send(event);
+    } else {
+        // Repeating text and diagnostics remain observational and must not stall
+        // the hooked application when the GUI is slow.
+        let _ = events.try_send(event);
+    }
 }
 
 fn send_command(
@@ -666,7 +771,9 @@ fn tokens_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
-async fn read_message<T>(stream: &mut UnixStream) -> Result<T, BridgeServerError>
+async fn read_message<T>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<T, BridgeServerError>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
@@ -680,7 +787,7 @@ where
 }
 
 async fn write_message<T: serde::Serialize>(
-    stream: &mut UnixStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     message: &T,
 ) -> Result<(), BridgeServerError> {
     let bytes = encode(message)?;
@@ -781,6 +888,37 @@ mod tests {
             }
             Err(error) => panic!("could not bind test hook service: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_transport_emits_wine_candidates() {
+        let path = socket_path("tcp");
+        let token = [17; 32];
+        let Some(service) = bind_service(&path, token) else {
+            return;
+        };
+        let bridge_id = Uuid::new_v4();
+        let mut client = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, service.tcp_port()))
+            .await
+            .unwrap();
+        write_message(&mut client, &BridgeMessage::Hello(hello(token, bridge_id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_message::<HostMessage>(&mut client).await.unwrap(),
+            HostMessage::Accept {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
+        let expected = candidate(Uuid::new_v4());
+        write_message(&mut client, &BridgeMessage::Candidate(expected.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv_until(&service, |event| matches!(event, HookEvent::Candidate { .. })),
+            HookEvent::Candidate { bridge, candidate }
+                if bridge.bridge_id == bridge_id && candidate == expected
+        ));
     }
 
     fn recv_until(service: &HookService, predicate: impl Fn(&HookEvent) -> bool) -> HookEvent {
