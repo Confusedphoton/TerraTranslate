@@ -58,9 +58,14 @@ run. Game identity fields are stable and do not include a PID. Supported scalar 
 `{{game.runtime}}`, `{{source_language}}`, `{{target_language}}`, `{{branch}}`,
 `{{context.summary}}`, `{{context.style}}`, `{{context.scratchpad}}`, `{{context.glossary}}`, and
 `{{context.entities}}`. `{{texts}}` joins text inputs, while `{{texts|enumerate}}` labels each one
-with its one-based position. For custom formatting, `{{#each texts}}...{{/each}}` exposes
-`{{number}}`, `{{label}}`, `{{text}}`, `{{hook_id}}`, `{{source}}`, and `{{target}}` inside the
-loop. The `trim`, `upper`, `lower`, and `json` filters can be applied with `|` (or `:`).
+with its one-based position. `{{updated_texts}}`, `{{updated_texts|enumerate}}`, and
+`{{updated_hook_count}}` expose only newly observed inputs. For custom formatting,
+`{{#each texts}}...{{/each}}` exposes `{{number}}`, `{{label}}`, `{{text}}`, `{{hook_id}}`,
+`{{source}}`, `{{target}}`, and `{{updated}}` inside the loop. Conditional blocks use
+`{{#if updated_hooks}}...{{else}}...{{/if}}` or `{{#unless updated_hooks}}...{{/unless}}`; inside
+a hook loop, `{{#if updated}}...{{/if}}` checks the current hook. The `trim`, `upper`, `lower`,
+and `json` filters can be applied with `|` (or `:`), and `{{texts|default("fallback")}}` supplies
+a configurable fallback for an empty value.
 
 An endless-context request is an explicit one-shot exception at the model-request boundary. The
 engine walks every commit reachable from the active game's `main` in oldest-first order and sends the source,
@@ -87,7 +92,9 @@ launcher should additionally apply process timeouts, memory limits, and a seccom
   model. Disconnect removes runtime routing without deleting saved configuration.
 - The GTK app exposes semantic candidates and supplemental native AT-SPI text objects as
   independently selectable model inputs, including optional labels and ordered per-hook pre/post
-  processors. Contemporaneous hooks with compatible postprocessing are coalesced into one turn.
+  processors. By default, a turn contains only hooks that reported new text; an optional latest-
+  value mode can add the most recently observed value from every enabled hook. Contemporaneous
+  hooks with compatible postprocessing are coalesced into one turn.
 - The GTK HUD can switch at runtime between a decorated positioning mode and a frameless overlay
   mode, and can be hidden or shown from the control window. The ordinary Wayland toplevel is the
   default because the compositor can move and resize it while retaining its position when the

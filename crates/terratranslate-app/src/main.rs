@@ -92,6 +92,9 @@ struct ModelSettings {
     target_language: String,
     system_prompt: String,
     user_prompt: String,
+    /// Keep the default event-oriented behavior when false. When true, a new
+    /// hook event also sends the latest value known for every enabled hook.
+    include_latest_hook_text: bool,
 }
 
 impl Default for ModelSettings {
@@ -102,7 +105,8 @@ impl Default for ModelSettings {
             source_language: String::new(),
             target_language: "English".into(),
             system_prompt: "Translate faithfully while preserving character voice.".into(),
-            user_prompt: "Translate every text hook into {{target_language}} in order.\n\n{{texts|enumerate}}".into(),
+            user_prompt: "{{#if updated_hooks}}Translate every text hook into {{target_language}} in order.\n\n{{texts|enumerate}}{{else}}No hook reported new text.{{/if}}".into(),
+            include_latest_hook_text: false,
         }
     }
 }
@@ -115,6 +119,7 @@ struct PendingHookText {
     source: SourceKind,
     target: String,
     text: String,
+    updated: bool,
     config: TextHookConfig,
 }
 
@@ -187,6 +192,7 @@ struct AppModel {
     text_hook_configs: BTreeMap<String, TextHookConfig>,
     text_hook_indices: BTreeMap<String, usize>,
     hook_routes: BTreeMap<String, BTreeMap<Uuid, Uuid>>,
+    latest_hook_text: BTreeMap<(Option<String>, String), PendingHookText>,
     text_hook_configs_path: PathBuf,
     pending_hook_text: VecDeque<PendingHookText>,
     translation_pending: bool,
@@ -236,6 +242,7 @@ enum AppMsg {
     TargetLanguage(String),
     SystemPrompt(String),
     UserPrompt(String),
+    IncludeLatestHookText(bool),
 }
 
 #[derive(Debug)]
@@ -611,10 +618,16 @@ impl Component for AppModel {
                                         gtk::Entry {
                                             set_hexpand: true,
                                             set_text: &model.model_settings.user_prompt,
-                                            set_placeholder_text: Some("Use {{texts|enumerate}} or {{#each texts}}...{{/each}} for multiple hooks"),
+                                            set_placeholder_text: Some("Use {{texts|enumerate}}, {{#if updated_hooks}}...{{else}}...{{/if}}, or {{texts|default(\"No hook text\")}}"),
                                             connect_changed[sender] => move |entry| {
                                                 sender.input(AppMsg::UserPrompt(entry.text().to_string()));
                                             },
+                                        },
+                                        gtk::Label {
+                                            set_label: "Prompt scripting: use {{#if updated_hooks}}...{{else}}...{{/if}} for surrounding text, {{#each texts}}...{{/each}} for hook loops, and {{texts|default(\"fallback\")}} for empty values. Inside a loop, {{#if updated}} checks whether that hook changed.",
+                                            set_wrap: true,
+                                            set_halign: gtk::Align::Start,
+                                            add_css_class: "dim-label",
                                         },
                                     },
                                 },
@@ -859,6 +872,21 @@ impl Component for AppModel {
                                         set_halign: gtk::Align::Start,
                                         add_css_class: "dim-label",
                                     },
+                                    gtk::CheckButton {
+                                        set_label: Some("Include latest text from every enabled hook"),
+                                        #[watch]
+                                        set_active: model.model_settings.include_latest_hook_text,
+                                        set_tooltip_text: Some("By default, each turn contains only hooks that reported new text. Enable this to resend the latest observed value from every compatible enabled hook whenever one hook updates."),
+                                        connect_toggled[sender] => move |button| {
+                                            sender.input(AppMsg::IncludeLatestHookText(button.is_active()));
+                                        },
+                                    },
+                                    gtk::Label {
+                                        set_label: "Default: only newly reported hook text is sent. Optional mode: one new event triggers a snapshot of all compatible enabled hooks with known values; unchanged text is sent again, and hooks without a value yet are left out.",
+                                        set_wrap: true,
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                    },
                                     gtk::ScrolledWindow {
                                         set_min_content_height: 180,
                                         set_vexpand: true,
@@ -1009,6 +1037,7 @@ impl Component for AppModel {
             text_hook_configs: init.text_hook_configs,
             text_hook_indices: BTreeMap::new(),
             hook_routes: BTreeMap::new(),
+            latest_hook_text: BTreeMap::new(),
             text_hook_configs_path: init.text_hook_configs_path,
             pending_hook_text: VecDeque::new(),
             translation_pending: false,
@@ -1359,6 +1388,21 @@ impl Component for AppModel {
                         }
                     }
                 }
+                if config.enabled {
+                    for pending in &mut self.pending_hook_text {
+                        if pending.hook_id == id {
+                            pending.config = config.clone();
+                        }
+                    }
+                    for pending in self.latest_hook_text.values_mut() {
+                        if pending.hook_id == id {
+                            pending.config = config.clone();
+                        }
+                    }
+                } else {
+                    self.latest_hook_text
+                        .retain(|(_, hook_id), _| hook_id != &id);
+                }
                 self.text_hook_configs.insert(id, config);
                 if let Err(error) = save_json(
                     &self.text_hook_configs_path,
@@ -1376,6 +1420,8 @@ impl Component for AppModel {
                             .disable_candidate(bridge_id, candidate_id);
                     }
                 }
+                self.latest_hook_text
+                    .retain(|(_, hook_id), _| hook_id != &id);
                 self.text_hook_configs.remove(&id);
                 if let Some(index) = self.text_hook_indices.remove(&id) {
                     self.text_hooks.guard().remove(index);
@@ -1415,6 +1461,10 @@ impl Component for AppModel {
             }
             AppMsg::UserPrompt(value) => {
                 self.model_settings.user_prompt = value;
+                self.save_model_settings();
+            }
+            AppMsg::IncludeLatestHookText(enabled) => {
+                self.model_settings.include_latest_hook_text = enabled;
                 self.save_model_settings();
             }
         }
@@ -1709,6 +1759,7 @@ impl AppModel {
                         source: SourceKind::NativeHook,
                         target: format!("{}{}", event.application_id, event.object_path),
                         text: event.text,
+                        updated: true,
                         config: TextHookConfig::default(),
                     });
                 }
@@ -1819,6 +1870,7 @@ impl AppModel {
                         },
                         target: format!("{}:{}", executable, event.stable_key),
                         text,
+                        updated: true,
                         config: TextHookConfig::default(),
                     });
                 }
@@ -1938,6 +1990,13 @@ impl AppModel {
             self.begin_replay_detection();
         }
         pending.config = config;
+        self.latest_hook_text.insert(
+            (
+                pending.game.as_ref().map(|game| game.id.0.clone()),
+                pending.hook_id.clone(),
+            ),
+            pending.clone(),
+        );
         const MAX_PENDING_HOOK_TEXT: usize = 256;
         if self.pending_hook_text.len() == MAX_PENDING_HOOK_TEXT {
             self.pending_hook_text.pop_front();
@@ -2104,7 +2163,16 @@ impl AppModel {
                 self.pending_hook_text.push_back(pending);
             }
         }
-        Some(batch)
+        if self.model_settings.include_latest_hook_text {
+            Some(latest_hook_snapshot(
+                batch,
+                &mut self.pending_hook_text,
+                &self.latest_hook_text,
+                &self.text_hook_configs,
+            ))
+        } else {
+            Some(batch)
+        }
     }
 
     fn try_replay_batch(&mut self, batch: &[PendingHookText]) -> bool {
@@ -2723,6 +2791,7 @@ async fn translate_hook_batch(
                     pre_prompt: pending.config.pre_processors(),
                     post_translation: pending.config.post_processors(),
                 },
+                updated: pending.updated,
             }),
         })
         .collect();
@@ -2740,6 +2809,65 @@ async fn translate_hook_batch(
         })
         .await
         .map_err(Into::into)
+}
+
+fn latest_hook_snapshot(
+    trigger_batch: Vec<PendingHookText>,
+    pending_hook_text: &mut VecDeque<PendingHookText>,
+    latest_hook_text: &BTreeMap<(Option<String>, String), PendingHookText>,
+    text_hook_configs: &BTreeMap<String, TextHookConfig>,
+) -> Vec<PendingHookText> {
+    let Some(first) = trigger_batch.first() else {
+        return trigger_batch;
+    };
+    let first_game_id = first.game.as_ref().map(|game| game.id.clone());
+    let first_post_processors = first.config.post_processors();
+    let mut snapshot = latest_hook_text
+        .values()
+        .filter(|pending| {
+            pending.game.as_ref().map(|game| game.id.clone()) == first_game_id
+                && pending.config.post_processors() == first_post_processors
+                && text_hook_configs
+                    .get(&pending.hook_id)
+                    .is_some_and(|config| config.enabled)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if snapshot.is_empty() {
+        return trigger_batch;
+    }
+
+    let mut updated_hook_ids = trigger_batch
+        .iter()
+        .map(|pending| pending.hook_id.clone())
+        .collect::<Vec<_>>();
+    for pending in pending_hook_text.iter() {
+        let same_game = pending.game.as_ref().map(|game| game.id.clone()) == first_game_id;
+        let same_pipeline = pending.config.post_processors() == first_post_processors;
+        let included = snapshot
+            .iter()
+            .any(|current| current.hook_id == pending.hook_id);
+        if same_game && same_pipeline && included {
+            updated_hook_ids.push(pending.hook_id.clone());
+        }
+    }
+    for pending in &mut snapshot {
+        pending.updated = updated_hook_ids.iter().any(|id| id == &pending.hook_id);
+    }
+    snapshot.sort_by(|left, right| {
+        left.captured_at_ms
+            .cmp(&right.captured_at_ms)
+            .then_with(|| left.hook_id.cmp(&right.hook_id))
+    });
+    pending_hook_text.retain(|pending| {
+        let same_game = pending.game.as_ref().map(|game| game.id.clone()) == first_game_id;
+        let same_pipeline = pending.config.post_processors() == first_post_processors;
+        let included = snapshot
+            .iter()
+            .any(|current| current.hook_id == pending.hook_id);
+        !(same_game && same_pipeline && included)
+    });
+    snapshot
 }
 
 fn initialize_store(data_dir: &Path) -> Result<SessionStore> {
@@ -3061,5 +3189,83 @@ mod wine_hook_startup_tests {
 
         assert_eq!(native_application_option_label(&first), "Example — :1.10");
         assert_eq!(native_application_option_label(&second), "Example — :1.11");
+    }
+}
+
+#[cfg(test)]
+mod hook_batch_tests {
+    use super::*;
+
+    fn game() -> GameIdentity {
+        GameIdentity::from_stable_key(
+            "example-game",
+            "Example",
+            "/tmp/example",
+            None,
+            "linux",
+            "native",
+        )
+    }
+
+    fn pending(
+        game: &GameIdentity,
+        hook_id: &str,
+        text: &str,
+        captured_at_ms: i64,
+    ) -> PendingHookText {
+        PendingHookText {
+            game: Some(game.clone()),
+            hook_id: hook_id.into(),
+            captured_at_ms,
+            source: SourceKind::NativeHook,
+            target: game.executable_path.clone(),
+            text: text.into(),
+            updated: true,
+            config: TextHookConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn latest_hook_text_mode_is_disabled_by_default_and_for_older_settings() {
+        assert!(!ModelSettings::default().include_latest_hook_text);
+        let settings: ModelSettings = serde_json::from_str(r#"{"model":"example"}"#).unwrap();
+        assert!(!settings.include_latest_hook_text);
+    }
+
+    #[test]
+    fn latest_hook_snapshot_includes_known_enabled_hooks_and_consumes_their_pending_events() {
+        let game = game();
+        let dialogue = pending(&game, "dialogue", "new dialogue", 200);
+        let choice = pending(&game, "choice", "last choice", 100);
+        let mut latest = BTreeMap::new();
+        latest.insert(
+            (Some(game.id.0.clone()), dialogue.hook_id.clone()),
+            dialogue.clone(),
+        );
+        latest.insert(
+            (Some(game.id.0.clone()), choice.hook_id.clone()),
+            choice.clone(),
+        );
+        let mut pending_events = VecDeque::from([dialogue.clone()]);
+        let configs = BTreeMap::from([
+            (dialogue.hook_id.clone(), dialogue.config.clone()),
+            (choice.hook_id.clone(), choice.config.clone()),
+        ]);
+
+        let snapshot = latest_hook_snapshot(vec![dialogue], &mut pending_events, &latest, &configs);
+
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|pending| pending.hook_id.as_str())
+                .collect::<Vec<_>>(),
+            ["choice", "dialogue"]
+        );
+        assert!(!snapshot[0].updated);
+        assert!(snapshot[1].updated);
+        assert!(pending_events.is_empty());
     }
 }

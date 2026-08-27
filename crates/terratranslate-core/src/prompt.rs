@@ -18,6 +18,9 @@ pub struct PromptText {
     pub source: String,
     #[serde(default)]
     pub target: String,
+    /// Whether this text was newly observed for the current model turn.
+    #[serde(default)]
+    pub updated: bool,
 }
 
 /// Values available while rendering system and user prompt templates.
@@ -48,6 +51,20 @@ pub enum PromptTemplateError {
     UnclosedEnumeration,
     #[error("unexpected prompt enumeration terminator")]
     UnexpectedEnumerationEnd,
+    #[error("prompt block is not closed: {0}")]
+    UnclosedBlock(String),
+    #[error("unexpected prompt block terminator: {0}")]
+    UnexpectedBlockEnd(String),
+    #[error("unexpected prompt else branch")]
+    UnexpectedElse,
+    #[error("prompt block has more than one else branch")]
+    MultipleElse,
+    #[error("unknown prompt block: {0}")]
+    UnknownBlock(String),
+    #[error("unknown prompt condition: {0}")]
+    UnknownCondition(String),
+    #[error("invalid prompt filter argument: {0}")]
+    InvalidFilterArgument(String),
     #[error("unknown prompt macro: {0}")]
     UnknownMacro(String),
     #[error("unknown prompt format filter: {0}")]
@@ -66,8 +83,7 @@ impl PromptTemplate {
     }
 
     pub fn render(&self, data: &PromptData) -> Result<String, PromptTemplateError> {
-        render_enumeration_blocks(&self.source, data)
-            .and_then(|rendered| render_fragment(&rendered, data, None))
+        render_template_fragment(&self.source, data)
     }
 }
 
@@ -78,38 +94,141 @@ pub fn render_prompt(
     PromptTemplate::new(template).render(data)
 }
 
-fn render_enumeration_blocks(
+struct BlockParts<'a> {
+    body: &'a str,
+    alternate: Option<&'a str>,
+    end: usize,
+}
+
+fn render_template_fragment(
     source: &str,
     data: &PromptData,
 ) -> Result<String, PromptTemplateError> {
-    let close = "{{/each}}";
-    let mut rendered = source.to_owned();
+    render_template_fragment_for_text(source, data, None)
+}
 
+fn render_template_fragment_for_text(
+    source: &str,
+    data: &PromptData,
+    current_text: Option<&PromptText>,
+) -> Result<String, PromptTemplateError> {
+    let mut rendered = String::with_capacity(source.len());
+    let mut cursor = 0;
     loop {
-        let Some((open_start, open_len)) =
-            ["{{#each texts}}", "{{#each hooks}}", "{{#each text_hooks}}"]
-                .iter()
-                .filter_map(|open| rendered.find(open).map(|start| (start, open.len())))
-                .min_by_key(|(start, _)| *start)
-        else {
-            if rendered.contains(close) {
-                return Err(PromptTemplateError::UnexpectedEnumerationEnd);
-            }
+        let Some(relative_start) = source[cursor..].find("{{#") else {
+            rendered.push_str(&render_fragment(&source[cursor..], data, current_text)?);
             return Ok(rendered);
         };
-        let body_start = open_start + open_len;
-        let Some(close_relative) = rendered[body_start..].find(close) else {
-            return Err(PromptTemplateError::UnclosedEnumeration);
+        let open_start = cursor + relative_start;
+        rendered.push_str(&render_fragment(
+            &source[cursor..open_start],
+            data,
+            current_text,
+        )?);
+        let token_start = open_start + 2;
+        let Some(relative_end) = source[token_start..].find("}}") else {
+            return Err(PromptTemplateError::UnclosedMacro(
+                source[token_start..].trim().to_owned(),
+            ));
         };
-        let close_start = body_start + close_relative;
-        let body = &rendered[body_start..close_start];
-        let replacement = data
-            .texts
-            .iter()
-            .map(|text| render_fragment(body, data, Some(text)))
-            .collect::<Result<Vec<_>, _>>()?
-            .join("");
-        rendered.replace_range(open_start..close_start + close.len(), &replacement);
+        let token_end = token_start + relative_end;
+        let block = source[token_start + 1..token_end].trim();
+        let (block_name, argument) = split_block_tag(block);
+        let parts = find_block_parts(source, token_end + 2, block_name)?;
+        let rendered_block = match block_name {
+            "each" => {
+                if !matches!(argument, "texts" | "hooks" | "text_hooks") {
+                    return Err(PromptTemplateError::UnknownBlock(block.to_owned()));
+                }
+                if parts.alternate.is_some() {
+                    return Err(PromptTemplateError::UnexpectedElse);
+                }
+                data.texts
+                    .iter()
+                    .map(|text| render_template_fragment_for_text(parts.body, data, Some(text)))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("")
+            }
+            "if" | "unless" => {
+                let condition = evaluate_condition(argument, data, current_text)?;
+                let include_body = if block_name == "if" {
+                    condition
+                } else {
+                    !condition
+                };
+                let selected = if include_body {
+                    parts.body
+                } else {
+                    parts.alternate.unwrap_or_default()
+                };
+                render_template_fragment_for_text(selected, data, current_text)?
+            }
+            _ => return Err(PromptTemplateError::UnknownBlock(block.to_owned())),
+        };
+        rendered.push_str(&rendered_block);
+        cursor = parts.end;
+    }
+}
+
+fn split_block_tag(block: &str) -> (&str, &str) {
+    let mut parts = block.splitn(2, char::is_whitespace);
+    (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default().trim(),
+    )
+}
+
+fn find_block_parts<'a>(
+    source: &'a str,
+    body_start: usize,
+    expected: &str,
+) -> Result<BlockParts<'a>, PromptTemplateError> {
+    let mut stack = vec![expected.to_owned()];
+    let mut alternate_marker = None;
+    let mut alternate_start = None;
+    let mut cursor = body_start;
+    loop {
+        let Some(relative_start) = source[cursor..].find("{{") else {
+            return Err(if expected == "each" {
+                PromptTemplateError::UnclosedEnumeration
+            } else {
+                PromptTemplateError::UnclosedBlock(expected.to_owned())
+            });
+        };
+        let start = cursor + relative_start;
+        let token_start = start + 2;
+        let Some(relative_end) = source[token_start..].find("}}") else {
+            return Err(PromptTemplateError::UnclosedMacro(
+                source[token_start..].trim().to_owned(),
+            ));
+        };
+        let token_end = token_start + relative_end;
+        let token = source[token_start..token_end].trim();
+        if let Some(nested) = token.strip_prefix('#') {
+            let (nested_name, _) = split_block_tag(nested.trim());
+            stack.push(nested_name.to_owned());
+        } else if let Some(close) = token.strip_prefix('/') {
+            let close = close.trim();
+            if stack.last().map(String::as_str) != Some(close) {
+                return Err(PromptTemplateError::UnexpectedBlockEnd(close.to_owned()));
+            }
+            stack.pop();
+            if stack.is_empty() {
+                let first_end = alternate_marker.unwrap_or(start);
+                return Ok(BlockParts {
+                    body: &source[body_start..first_end],
+                    alternate: alternate_start.map(|alternate| &source[alternate..start]),
+                    end: token_end + 2,
+                });
+            }
+        } else if token == "else" && stack.len() == 1 {
+            if alternate_start.is_some() {
+                return Err(PromptTemplateError::MultipleElse);
+            }
+            alternate_marker = Some(start);
+            alternate_start = Some(token_end + 2);
+        }
+        cursor = token_end + 2;
     }
 }
 
@@ -135,8 +254,14 @@ fn render_fragment(
             return Err(if token == "/each" {
                 PromptTemplateError::UnexpectedEnumerationEnd
             } else {
-                PromptTemplateError::UnknownMacro(token.to_owned())
+                PromptTemplateError::UnknownBlock(token.to_owned())
             });
+        }
+        if token.starts_with('/') {
+            return Err(PromptTemplateError::UnexpectedBlockEnd(token.to_owned()));
+        }
+        if token == "else" {
+            return Err(PromptTemplateError::UnexpectedElse);
         }
         rendered.push_str(&render_macro(token, data, current_text)?);
         cursor = end + 2;
@@ -185,12 +310,24 @@ fn render_macro(
                 .unwrap_or_else(|| join_texts(data)),
         ),
         "texts" | "hooks" => Some(join_texts(data)),
+        "updated_texts" | "updated_hooks" => Some(join_updated_texts(data)),
         "texts.enumerate"
         | "texts.enumerated"
         | "hooks.enumerate"
         | "text_hooks"
-        | "text_hooks.enumerate" => Some(enumerate_texts(data)),
+        | "text_hooks.enumerate" => Some(enumerate_texts(data, false)),
+        "updated_texts.enumerate" | "updated_texts.enumerated" | "updated_hooks.enumerate" => {
+            Some(enumerate_texts(data, true))
+        }
         "texts.count" | "hooks.count" | "hook_count" => Some(data.texts.len().to_string()),
+        "updated_texts.count" | "updated_hooks.count" | "updated_hook_count" => {
+            Some(updated_text_count(data).to_string())
+        }
+        "updated" | "text.updated" | "this.updated" => Some(
+            current_text
+                .map(|text| text.updated.to_string())
+                .unwrap_or_else(|| has_updated_text(data).to_string()),
+        ),
         "index" | "number" | "@index" | "text.index" | "this.index" => {
             current_text.map(|text| text.index.to_string())
         }
@@ -212,9 +349,72 @@ fn render_macro(
         Some("lower") => Ok(value.to_lowercase()),
         Some("json") => Ok(json_string(&value)),
         Some("enumerate") if matches!(name, "texts" | "hooks" | "text_hooks") => {
-            Ok(enumerate_texts(data))
+            Ok(enumerate_texts(data, false))
+        }
+        Some("enumerate") if matches!(name, "updated_texts" | "updated_hooks") => {
+            Ok(enumerate_texts(data, true))
+        }
+        Some(filter) if filter.starts_with("default(") && filter.ends_with(')') => {
+            let fallback = parse_default_argument(&filter["default(".len()..filter.len() - 1])?;
+            if value.trim().is_empty() {
+                Ok(fallback)
+            } else {
+                Ok(value)
+            }
+        }
+        Some(filter) if filter.starts_with("default:") => {
+            let fallback = parse_default_argument(&filter["default:".len()..])?;
+            if value.trim().is_empty() {
+                Ok(fallback)
+            } else {
+                Ok(value)
+            }
         }
         Some(filter) => Err(PromptTemplateError::UnknownFilter(filter.to_owned())),
+    }
+}
+
+fn evaluate_condition(
+    condition: &str,
+    data: &PromptData,
+    current_text: Option<&PromptText>,
+) -> Result<bool, PromptTemplateError> {
+    let condition = condition.trim();
+    let (negated, condition) = condition
+        .strip_prefix('!')
+        .map(|condition| (true, condition.trim()))
+        .unwrap_or((false, condition));
+    let value = match condition {
+        "true" => true,
+        "false" => false,
+        "texts" | "hooks" | "text_hooks" => !data.texts.is_empty(),
+        "updated_texts" | "updated_hooks" | "has_updated_hook" => has_updated_text(data),
+        "updated" | "text.updated" | "this.updated" => {
+            current_text.is_some_and(|text| text.updated)
+        }
+        _ => return Err(PromptTemplateError::UnknownCondition(condition.to_owned())),
+    };
+    Ok(if negated { !value } else { value })
+}
+
+fn parse_default_argument(argument: &str) -> Result<String, PromptTemplateError> {
+    let argument = argument.trim();
+    if argument.len() >= 2
+        && ((argument.starts_with('"') && argument.ends_with('"'))
+            || (argument.starts_with('\'') && argument.ends_with('\'')))
+    {
+        if argument.starts_with('"') {
+            serde_json::from_str(argument)
+                .map_err(|_| PromptTemplateError::InvalidFilterArgument(argument.to_owned()))
+        } else {
+            Ok(argument[1..argument.len() - 1].replace("\\'", "'"))
+        }
+    } else if argument.is_empty() {
+        Err(PromptTemplateError::InvalidFilterArgument(
+            argument.to_owned(),
+        ))
+    } else {
+        Ok(argument.to_owned())
     }
 }
 
@@ -226,16 +426,36 @@ fn join_texts(data: &PromptData) -> String {
         .join("\n")
 }
 
-fn enumerate_texts(data: &PromptData) -> String {
+fn join_updated_texts(data: &PromptData) -> String {
     data.texts
         .iter()
-        .map(|text| {
+        .filter(|text| text.updated)
+        .map(|text| text.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn updated_text_count(data: &PromptData) -> usize {
+    data.texts.iter().filter(|text| text.updated).count()
+}
+
+fn has_updated_text(data: &PromptData) -> bool {
+    data.texts.iter().any(|text| text.updated)
+}
+
+fn enumerate_texts(data: &PromptData, updated_only: bool) -> String {
+    data.texts
+        .iter()
+        .filter(|text| !updated_only || text.updated)
+        .enumerate()
+        .map(|(index, text)| {
             let label = text
                 .label
                 .as_deref()
                 .or(text.hook_id.as_deref())
                 .unwrap_or("text hook");
-            format!("[{}] {label}:\n{}", text.index, text.text)
+            let number = if updated_only { index + 1 } else { text.index };
+            format!("[{number}] {label}:\n{}", text.text)
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -280,6 +500,7 @@ mod tests {
                     text: "こんにちは".into(),
                     source: "wine_hook".into(),
                     target: "story.exe".into(),
+                    updated: true,
                 },
                 PromptText {
                     index: 2,
@@ -288,6 +509,7 @@ mod tests {
                     text: "はい".into(),
                     source: "wine_hook".into(),
                     target: "story.exe".into(),
+                    updated: false,
                 },
             ],
         }
@@ -313,6 +535,30 @@ mod tests {
             .unwrap();
         assert!(rendered.contains("[1] Dialogue:\nこんにちは"));
         assert!(rendered.contains('"'));
+    }
+
+    #[test]
+    fn renders_updated_conditionals_nested_in_hook_loops() {
+        let rendered = PromptTemplate::new(
+            "{{#if updated_hooks}}Updated: {{updated_texts|enumerate}}{{else}}No updates{{/if}}|{{#each texts}}{{#if updated}}new{{else}}old{{/if}}={{text}};{{/each}}",
+        )
+        .render(&data())
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Updated: [1] Dialogue:\nこんにちは|new=こんにちは;old=はい;"
+        );
+    }
+
+    #[test]
+    fn renders_configurable_defaults_and_else_branches() {
+        let empty = PromptData::default();
+        let rendered = PromptTemplate::new(
+            "{{#unless updated_hooks}}No updated hook{{else}}Updated{{/unless}} / {{texts|default(\"fallback message\")}}",
+        )
+        .render(&empty)
+        .unwrap();
+        assert_eq!(rendered, "No updated hook / fallback message");
     }
 
     #[test]

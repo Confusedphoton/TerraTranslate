@@ -30,13 +30,26 @@ pub struct TextProcessingSelection {
     pub post_translation: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextInputOptions {
     /// Stable producer identity, independent of a connection UUID, PID, or ASLR.
     pub stable_hook_key: Option<String>,
     /// An optional user-facing name that is included with this input in the model request.
     pub label: Option<String>,
     pub processing: TextProcessingSelection,
+    /// Whether this input represents newly observed text for the current turn.
+    pub updated: bool,
+}
+
+impl Default for TextInputOptions {
+    fn default() -> Self {
+        Self {
+            stable_hook_key: None,
+            label: None,
+            processing: TextProcessingSelection::default(),
+            updated: true,
+        }
+    }
 }
 
 /// Controls which versioned context is assembled for a translation request.
@@ -260,6 +273,11 @@ impl TranslationEngine {
                         text: processed.clone(),
                         source: source_kind_name(&input_source).into(),
                         target: input_target.clone(),
+                        updated: input
+                            .text_options
+                            .as_ref()
+                            .map(|options| options.updated)
+                            .unwrap_or(true),
                     });
                     model_inputs.push(ModelInput::Text(label_text_input(
                         input
@@ -884,6 +902,7 @@ mod tests {
                             pre_prompt: vec!["builtin.normalize_whitespace".into()],
                             post_translation: vec![],
                         },
+                        updated: true,
                     }),
                 }],
             })
@@ -990,6 +1009,7 @@ mod tests {
                     pre_prompt: vec![],
                     post_translation,
                 },
+                updated: true,
             }),
         };
         let result = engine
